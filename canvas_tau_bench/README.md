@@ -20,20 +20,36 @@ A standalone minimal implementation independent of `tau-bench`:
 - `assistant`: The policy model being distilled.
 - `user`: The critic providing turn-level feedback.
 - The assistant is expected to output:
-  - `<think>...</think>` every turn
-  - `<tool>{"name":"...","args":{...}}</tool>` when executing one CRUD action
-  - `<answer>...</answer>` when replying without a tool action
+  - Non-final turns should include `<think>...</think>` and advance only one step
+  - `<tool>{"name":"...","args":{...}}</tool>` when executing one CRUD action for that step
+  - Final answer only as `<answer>\boxed{final_answer}</answer>` (also accepts `/boxed{...}` for compatibility)
+  - Do not include extra text inside `<answer>` beyond the boxed payload
+  - Do not include extra text outside `<answer>` in the final turn
 - The environment executes the tool, compares rendered-vs-target state, and sends critic feedback back as `user` content.
 - Episode termination is answer-gated:
-  - Stop only when `<answer>` appears and is correct.
-  - Correct means rendered state matches target and required output tokens are satisfied.
-  - If `<answer>` appears but is wrong, critic input includes an explicit hallucination-check diagnostic notice.
+  - Critic decides correctness (not hard-coded output matching).
+  - Stop only when `<answer>` appears and critic returns `VERDICT: CORRECT`.
+  - If `<answer>` appears but is wrong, critic receives target render, rendered result, gold answers, model answer, and hallucination-check notice.
 
 Example assistant turn:
 
 ```text
 <think>I should insert the first node under root.</think>
 <tool>{"name":"insert_element","args":{"fragment":"<div id='plan'>draft</div>","rootId":"root"}}</tool>
+```
+
+Example final answer:
+
+```text
+<answer>\boxed{done}</answer>
+```
+
+Critic decision format for answer turns:
+
+```text
+VERDICT: CORRECT or VERDICT: INCORRECT
+REASON: ...
+FEEDBACK: ...
 ```
 
 ## Install
@@ -80,9 +96,10 @@ python /m2/slz/lrt/canvas_tau_bench/run.py \
 
 - This is a standalone implementation and does not modify original `tau-bench` code.
 - Three demo tasks are included by default. You can replace them in `build_demo_tasks()` inside `run.py`.
-- `finish_canvas` is treated as a normal tool action in this setup; termination is still answer-gated.
+- `finish_canvas` is treated as a normal tool action; only critic-accepted final answer ends the episode.
 - By default, results are saved as:
   - `*.json`: full trajectories and reward metadata
   - `*.sft.jsonl`: assistant-turn SFT records (`messages` + `assistant_target` + `turn_meta`)
 - Current renderer payload is JSON-based (`target_canvas` vs `rendered_canvas`). You can replace it with real image rendering while keeping the same critic loop API.
 - Critic context also exposes `target_image` and `rendered_image` fields (currently JSON payload aliases) so you can swap in real image paths/bytes later.
+- For answer turns, critic context includes `answer_check` with `gold_answers` and boxed model answer, enabling semantic-equivalence judgement (e.g., `0.5 == 1/2`).
