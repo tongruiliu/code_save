@@ -201,8 +201,10 @@ class LLMUserSimulation(BaseUserSimulation):
     def __init__(self, model: str, provider: str) -> None:
         self.model = model
         self.provider = provider
-        self.messages: List[Dict[str, Any]] = []
         self.total_cost = 0.0
+        self.instruction: str = ""
+        self.target_canvas: Dict[str, Any] = {}
+        self.target_image_url: str = ""
 
     def _build_system_prompt(self) -> str:
         return (
@@ -256,53 +258,44 @@ class LLMUserSimulation(BaseUserSimulation):
             return "".join(parts).strip()
         return str(content)
 
+    def _generate_once(self, messages: List[Dict[str, Any]]) -> str:
+        res = completion(
+            model=self.model,
+            custom_llm_provider=self.provider,
+            messages=messages,
+        )
+        msg = res.choices[0].message
+        self.total_cost += (res._hidden_params.get("response_cost") or 0.0)
+        return self._message_content_to_text(msg.content)
+
     def reset(
         self,
         instruction: Optional[str] = None,
         target_canvas: Optional[Dict[str, Any]] = None,
         target_image_url: Optional[str] = None,
     ) -> str:
-        text_blocks = [
-            "Task Initialization",
-            f"Question: {instruction or ''}",
-        ]
-        if target_canvas:
-            text_blocks.append(f"Target canvas metadata: {json.dumps(target_canvas, ensure_ascii=False)}")
-        self.messages = [
-            {"role": "system", "content": self._build_system_prompt()},
-            {
-                "role": "user",
-                "content": self._as_multimodal_user_content(
-                    text_blocks=text_blocks,
-                    image_urls=[target_image_url] if target_image_url else [],
-                ),
-            },
-        ]
-        return self._next_message()
-
-    def _next_message(self) -> str:
-        res = completion(
-            model=self.model,
-            custom_llm_provider=self.provider,
-            messages=self.messages,
+        self.instruction = str(instruction or "")
+        self.target_canvas = dict(target_canvas or {})
+        self.target_image_url = str(target_image_url or "")
+        return (
+            "Proceed step by step. Each non-final turn should include one <think> and at most one <tool>. "
+            "Final turn must be answer-only: <answer>\\boxed{final_answer}</answer>."
         )
-        msg = res.choices[0].message
-        self.messages.append(msg.model_dump())
-        self.total_cost += (res._hidden_params.get("response_cost") or 0.0)
-        return self._message_content_to_text(msg.content)
 
     def step(self, assistant_message: str, context: Optional[Dict[str, Any]] = None) -> str:
         ctx = dict(context or {})
-        target_image_url = str(ctx.get("target_image_url", "") or "")
         rendered_image_url = str(ctx.get("rendered_image_url", "") or "")
-        instruction = str(ctx.get("instruction", "") or "")
         answer_check = ctx.get("answer_check")
         answer_eval = ctx.get("answer_evaluation")
 
         text_blocks = [
-            f"Question: {instruction}",
+            f"Question: {self.instruction}",
             f"Assistant turn: {assistant_message}",
         ]
+        if self.target_canvas:
+            text_blocks.append(
+                "Target canvas metadata: " + json.dumps(self.target_canvas, ensure_ascii=False)
+            )
         if isinstance(answer_eval, dict) and answer_eval.get("has_answer"):
             text_blocks.append(
                 "Answer evaluation turn: return exactly VERDICT/REASON/FEEDBACK and judge semantic equivalence."
@@ -315,15 +308,23 @@ class LLMUserSimulation(BaseUserSimulation):
                 "Model boxed answer: " + str(answer_check.get("model_answer_boxed", ""))
             )
 
-        image_urls = [u for u in [target_image_url, rendered_image_url] if u]
-        self.messages.append({
-            "role": "user",
-            "content": self._as_multimodal_user_content(
-                text_blocks=text_blocks,
-                image_urls=image_urls,
-            ),
-        })
-        return self._next_message()
+        image_urls = []
+        if self.target_image_url:
+            image_urls.append(self.target_image_url)
+        if rendered_image_url:
+            image_urls.append(rendered_image_url)
+
+        messages = [
+            {"role": "system", "content": self._build_system_prompt()},
+            {
+                "role": "user",
+                "content": self._as_multimodal_user_content(
+                    text_blocks=text_blocks,
+                    image_urls=image_urls,
+                ),
+            },
+        ]
+        return self._generate_once(messages)
 
     def get_total_cost(self) -> float:
         return self.total_cost
