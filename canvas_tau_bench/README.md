@@ -30,6 +30,7 @@ A standalone minimal implementation independent of `tau-bench`:
   - Critic decides correctness (not hard-coded output matching).
   - Stop only when `<answer>` appears and critic returns `VERDICT: CORRECT`.
   - If `<answer>` appears but is wrong, critic receives target render, rendered result, gold answers, model answer, and hallucination-check notice.
+  - For SFT trajectory export, terminal samples are stored with assistant as the last speaker; critic verdict remains in turn metadata.
 
 Example assistant turn:
 

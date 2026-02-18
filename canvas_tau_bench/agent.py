@@ -150,13 +150,15 @@ class ToolCallingAgent:
                 }
             )
 
+            if env_res.done:
+                # Keep terminal trajectories ending at assistant output for SFT slicing.
+                messages.append({"role": "assistant", "content": assistant_content})
+                break
+
             messages.extend([
                 {"role": "assistant", "content": assistant_content},
                 {"role": "user", "content": env_res.observation},
             ])
-
-            if env_res.done:
-                break
 
         return SolveResult(
             reward=reward,
