@@ -3,7 +3,7 @@
 A standalone minimal implementation independent of `tau-bench`:
 - Keeps a **multi-turn policy-vs-critic loop** for distillation data generation.
 - Uses **Canvas CRUD** operations (`insert/modify/replace/remove/clear/finish`) as the action space.
-- Uses tau-bench-style reward computation (state-hash comparison against replayed target actions).
+- Keeps optional state-hash consistency scoring when a structured `target_canvas` is provided.
 - Exports assistant-turn SFT records in JSONL format.
 
 ## Structure
@@ -26,6 +26,14 @@ A standalone minimal implementation independent of `tau-bench`:
   - Do not include extra text inside `<answer>` beyond the boxed payload
   - Do not include extra text outside `<answer>` in the final turn
 - The environment executes the tool, compares rendered-vs-target state, and sends critic feedback back as `user` content.
+- Each non-terminal round feeds assistant with a `turn_feedback_bundle` that contains:
+  - `tool_response`
+  - `rendered_canvas` and `target_canvas`
+  - `rendered_image_url` (SVG data URL for the latest render)
+  - `critic_feedback`
+- The first assistant turn is initialized with an `init_bundle` that includes the target image (`target_image_url`).
+- Target image is expected to come from task input (`target_image_url` or `target_image_path`) in Canvas-style multimodal setup.
+- Target construction does not infer from tool traces; provide target inputs explicitly.
 - Episode termination is answer-gated:
   - Critic decides correctness (not hard-coded output matching).
   - Stop only when `<answer>` appears and critic returns `VERDICT: CORRECT`.
@@ -101,6 +109,5 @@ python /m2/slz/lrt/canvas_tau_bench/run.py \
 - By default, results are saved as:
   - `*.json`: full trajectories and reward metadata
   - `*.sft.jsonl`: assistant-turn SFT records (`messages` + `assistant_target` + `turn_meta`)
-- Current renderer payload is JSON-based (`target_canvas` vs `rendered_canvas`). You can replace it with real image rendering while keeping the same critic loop API.
-- Critic context also exposes `target_image` and `rendered_image` fields (currently JSON payload aliases) so you can swap in real image paths/bytes later.
+- Target and per-turn rendered snapshots are exported as SVG files and also passed as `data:image/svg+xml;base64,...` URLs for multimodal inputs.
 - For answer turns, critic context includes `answer_check` with `gold_answers` and boxed model answer, enabling semantic-equivalence judgement (e.g., `0.5 == 1/2`).

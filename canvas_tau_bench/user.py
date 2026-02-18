@@ -11,7 +11,12 @@ from litellm import completion
 
 class BaseUserSimulation(abc.ABC):
     @abc.abstractmethod
-    def reset(self, instruction: Optional[str] = None, target_canvas: Optional[Dict[str, Any]] = None) -> str:
+    def reset(
+        self,
+        instruction: Optional[str] = None,
+        target_canvas: Optional[Dict[str, Any]] = None,
+        target_image_url: Optional[str] = None,
+    ) -> str:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -24,12 +29,19 @@ class BaseUserSimulation(abc.ABC):
 
 
 class HumanUserSimulation(BaseUserSimulation):
-    def reset(self, instruction: Optional[str] = None, target_canvas: Optional[Dict[str, Any]] = None) -> str:
+    def reset(
+        self,
+        instruction: Optional[str] = None,
+        target_canvas: Optional[Dict[str, Any]] = None,
+        target_image_url: Optional[str] = None,
+    ) -> str:
         prompt = instruction or "Task:"
         print(prompt)
         if target_canvas is not None:
             print("Target render snapshot:")
             print(json.dumps(target_canvas, ensure_ascii=False, indent=2))
+        if target_image_url:
+            print(f"Target image url: {target_image_url[:120]}...")
         return input("critic> ")
 
     def step(self, assistant_message: str, context: Optional[Dict[str, Any]] = None) -> str:
@@ -51,7 +63,12 @@ class ScriptedUserSimulation(BaseUserSimulation):
         self.instruction = ""
         self.turn = 0
 
-    def reset(self, instruction: Optional[str] = None, target_canvas: Optional[Dict[str, Any]] = None) -> str:
+    def reset(
+        self,
+        instruction: Optional[str] = None,
+        target_canvas: Optional[Dict[str, Any]] = None,
+        target_image_url: Optional[str] = None,
+    ) -> str:
         self.instruction = instruction or ""
         self.turn = 0
         return (
@@ -126,7 +143,9 @@ class ScriptedUserSimulation(BaseUserSimulation):
         has_answer = bool(answer_eval.get("has_answer"))
         answer_format_ok = bool(answer_eval.get("format_ok"))
         tool_result = str(context.get("tool_result", ""))
-        matches_target = bool(context.get("matches_target"))
+        matches_target_raw = context.get("matches_target", None)
+        has_match_signal = isinstance(matches_target_raw, bool)
+        matches_target = bool(matches_target_raw)
         action_terminated = bool(context.get("action_terminated"))
 
         if has_answer:
@@ -140,7 +159,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
                     "<answer>\\boxed{final_answer}</answer> only."
                 )
 
-            if not matches_target:
+            if has_match_signal and not matches_target:
                 return (
                     "VERDICT: INCORRECT\n"
                     "REASON: Rendered canvas does not match target render.\n"
@@ -162,7 +181,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
                 "FEEDBACK: Task solved."
             )
 
-        if matches_target and not has_answer:
+        if has_match_signal and matches_target and not has_answer:
             return "Canvas now matches target. Provide answer-only final output: <answer>\\boxed{...}</answer>."
         if tool_result.startswith("Error:"):
             return "The last tool action failed. Fix the arguments and try again with one CRUD action."
@@ -206,15 +225,58 @@ class LLMUserSimulation(BaseUserSimulation):
             "- For non-answer turns, output one short actionable feedback sentence."
         )
 
-    def reset(self, instruction: Optional[str] = None, target_canvas: Optional[Dict[str, Any]] = None) -> str:
-        payload = {
-            "type": "task_init",
-            "instruction": instruction or "",
-            "target_canvas": target_canvas or {},
-        }
+    def _as_multimodal_user_content(
+        self,
+        text_blocks: List[str],
+        image_urls: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = []
+        for text in text_blocks:
+            t = str(text or "").strip()
+            if t:
+                content.append({"type": "text", "text": t})
+        for url in (image_urls or []):
+            if isinstance(url, str) and url:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                })
+        if not content:
+            content.append({"type": "text", "text": ""})
+        return content
+
+    def _message_content_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "".join(parts).strip()
+        return str(content)
+
+    def reset(
+        self,
+        instruction: Optional[str] = None,
+        target_canvas: Optional[Dict[str, Any]] = None,
+        target_image_url: Optional[str] = None,
+    ) -> str:
+        text_blocks = [
+            "Task Initialization",
+            f"Question: {instruction or ''}",
+        ]
+        if target_canvas:
+            text_blocks.append(f"Target canvas metadata: {json.dumps(target_canvas, ensure_ascii=False)}")
         self.messages = [
             {"role": "system", "content": self._build_system_prompt()},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": self._as_multimodal_user_content(
+                    text_blocks=text_blocks,
+                    image_urls=[target_image_url] if target_image_url else [],
+                ),
+            },
         ]
         return self._next_message()
 
@@ -227,15 +289,40 @@ class LLMUserSimulation(BaseUserSimulation):
         msg = res.choices[0].message
         self.messages.append(msg.model_dump())
         self.total_cost += (res._hidden_params.get("response_cost") or 0.0)
-        return msg.content
+        return self._message_content_to_text(msg.content)
 
     def step(self, assistant_message: str, context: Optional[Dict[str, Any]] = None) -> str:
-        payload = {
-            "type": "turn_feedback",
-            "assistant_message": assistant_message,
-            "context": context or {},
-        }
-        self.messages.append({"role": "user", "content": json.dumps(payload, ensure_ascii=False)})
+        ctx = dict(context or {})
+        target_image_url = str(ctx.get("target_image_url", "") or "")
+        rendered_image_url = str(ctx.get("rendered_image_url", "") or "")
+        instruction = str(ctx.get("instruction", "") or "")
+        answer_check = ctx.get("answer_check")
+        answer_eval = ctx.get("answer_evaluation")
+
+        text_blocks = [
+            f"Question: {instruction}",
+            f"Assistant turn: {assistant_message}",
+        ]
+        if isinstance(answer_eval, dict) and answer_eval.get("has_answer"):
+            text_blocks.append(
+                "Answer evaluation turn: return exactly VERDICT/REASON/FEEDBACK and judge semantic equivalence."
+            )
+        if isinstance(answer_check, dict):
+            text_blocks.append(
+                "Gold answers: " + json.dumps(answer_check.get("gold_answers", []), ensure_ascii=False)
+            )
+            text_blocks.append(
+                "Model boxed answer: " + str(answer_check.get("model_answer_boxed", ""))
+            )
+
+        image_urls = [u for u in [target_image_url, rendered_image_url] if u]
+        self.messages.append({
+            "role": "user",
+            "content": self._as_multimodal_user_content(
+                text_blocks=text_blocks,
+                image_urls=image_urls,
+            ),
+        })
         return self._next_message()
 
     def get_total_cost(self) -> float:

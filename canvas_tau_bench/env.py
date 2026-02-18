@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import html
 import json
+import mimetypes
+import os
 import re
+import uuid
 from typing import Any, Dict, List, Optional, Type
 
 from .tools import ALL_TOOLS, Tool, canvas_snapshot, init_canvas_data
@@ -75,8 +80,14 @@ class CanvasCRUDEnv:
         self.critic = load_user(user_strategy, model=user_model, provider=user_provider)
 
         self.data = init_canvas_data()
-        self.target_canvas = canvas_snapshot(init_canvas_data())
-        self.gt_hash = self._data_hash(init_canvas_data())
+        self.target_canvas: Dict[str, Any] = {}
+        self.gt_hash: Optional[str] = None
+        self.session_id = uuid.uuid4().hex[:10]
+        self.render_dir = os.path.join("/tmp", "canvas_tau_bench_svg", self.session_id)
+        os.makedirs(self.render_dir, exist_ok=True)
+        self.turn_id = 0
+        self.target_image_path = ""
+        self.target_image_url = ""
         self.actions: List[Action] = []
         self.assistant_messages: List[str] = []
         self.answer_history: List[str] = []
@@ -89,27 +100,95 @@ class CanvasCRUDEnv:
         self.actions = []
         self.assistant_messages = []
         self.answer_history = []
-        gt_data = self._replay_gt_data()
-        self.target_canvas = canvas_snapshot(gt_data)
-        self.gt_hash = self._data_hash(gt_data)
-        obs = self.critic.reset(instruction=self.task.instruction, target_canvas=self.target_canvas)
+        self.turn_id = 0
+        self.target_canvas = {}
+        self.target_image_path = ""
+        self.target_image_url = ""
+        self.gt_hash = None
+
+        task_target_url = str(getattr(self.task, "target_image_url", "") or "").strip()
+        task_target_path = str(getattr(self.task, "target_image_path", "") or "").strip()
+        task_target_canvas = getattr(self.task, "target_canvas", None)
+
+        if isinstance(task_target_canvas, dict) and task_target_canvas:
+            self.target_canvas = task_target_canvas
+            # If task directly provides target canvas in our state format, allow hash-based match.
+            if self._looks_like_canvas_state(task_target_canvas):
+                self.gt_hash = self._data_hash(task_target_canvas)
+
+        if task_target_url:
+            self.target_image_url = task_target_url
+            self.target_image_path = task_target_path
+        elif task_target_path:
+            resolved_path = self._resolve_image_path(task_target_path)
+            if resolved_path:
+                self.target_image_path = resolved_path
+                self.target_image_url = self._image_path_to_data_url(resolved_path)
+        elif self.target_canvas:
+            self.target_image_path, self.target_image_url = self._render_snapshot(
+                snapshot=self.target_canvas,
+                prefix="target",
+                title="Target Canvas",
+            )
+        else:
+            # Target visual must come from task inputs in Canvas-style setup.
+            self.target_canvas = {}
+            self.target_image_path = ""
+            self.target_image_url = ""
+
+        critic_opening = self.critic.reset(
+            instruction=self.task.instruction,
+            target_canvas=self.target_canvas,
+            target_image_url=self.target_image_url,
+        )
+        init_payload = {
+            "type": "init_bundle",
+            "instruction": self.task.instruction,
+            "target_canvas": self.target_canvas,
+            "target_image_path": self.target_image_path,
+            "target_image_url": self.target_image_url,
+            "critic_feedback": critic_opening,
+        }
+        obs = json.dumps(init_payload, ensure_ascii=False)
         return EnvResetResponse(observation=obs, info=EnvInfo(task=self.task, source="critic"))
 
     def _data_hash(self, data: Dict[str, Any]) -> str:
         payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _replay_gt_data(self) -> Dict[str, Any]:
-        gt_data = init_canvas_data()
-        for action in self.task.actions:
-            if action.name in self.tools_map and action.name not in self.terminate_tools:
-                self.tools_map[action.name].invoke(gt_data, **action.kwargs)
-        return gt_data
+    def _resolve_image_path(self, path: str) -> str:
+        if not path:
+            return ""
+        if os.path.exists(path):
+            return path
+        joined = os.path.join(os.getcwd(), path)
+        if os.path.exists(joined):
+            return joined
+        return ""
+
+    def _image_path_to_data_url(self, path: str) -> str:
+        mime, _ = mimetypes.guess_type(path)
+        if not mime:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".svg":
+                mime = "image/svg+xml"
+            elif ext in {".jpg", ".jpeg"}:
+                mime = "image/jpeg"
+            elif ext == ".webp":
+                mime = "image/webp"
+            else:
+                mime = "image/png"
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:{mime};base64,{encoded}"
+
+    def _looks_like_canvas_state(self, data: Dict[str, Any]) -> bool:
+        return all(k in data for k in ("id", "tag", "children"))
 
     def calculate_reward(self, critic_correct: bool) -> tuple[float, RewardInfo]:
         actual_hash = self._data_hash(self.data)
-        gt_hash = self.gt_hash
-        r_actions = actual_hash == gt_hash
+        gt_hash = self.gt_hash or ""
+        r_actions = bool(self.gt_hash and actual_hash == self.gt_hash)
 
         reward = 1.0 if critic_correct else 0.0
         r_outputs = 1.0 if critic_correct else 0.0
@@ -159,6 +238,52 @@ class CanvasCRUDEnv:
             return False
         return None
 
+    def _flatten_canvas_lines(self, node: Dict[str, Any], depth: int, lines: List[str]) -> None:
+        indent = "  " * depth
+        node_id = str(node.get("id", ""))
+        tag = str(node.get("tag", ""))
+        text_val = str(node.get("text", "")).strip()
+        attrs = node.get("attrs", {}) or {}
+        attrs_str = ""
+        if attrs:
+            attrs_parts = [f"{k}={v}" for k, v in attrs.items()]
+            attrs_str = " attrs[" + ", ".join(attrs_parts) + "]"
+        text_str = f" text[{text_val}]" if text_val else ""
+        lines.append(f"{indent}- {node_id}<{tag}>{attrs_str}{text_str}")
+        for child in node.get("children", []):
+            self._flatten_canvas_lines(child, depth + 1, lines)
+
+    def _canvas_to_svg(self, snapshot: Dict[str, Any], title: str) -> str:
+        lines: List[str] = [title]
+        self._flatten_canvas_lines(snapshot, depth=0, lines=lines)
+        row_h = 22
+        width = 1200
+        height = max(180, 40 + row_h * len(lines))
+        svg_lines = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+            f'<rect x="0" y="0" width="{width}" height="{height}" fill="white" stroke="#dddddd" />',
+        ]
+        for idx, line in enumerate(lines):
+            y = 28 + idx * row_h
+            safe = html.escape(line)
+            svg_lines.append(
+                f'<text x="12" y="{y}" font-family="monospace" font-size="14" fill="#222222">{safe}</text>'
+            )
+        svg_lines.append("</svg>")
+        return "".join(svg_lines)
+
+    def _svg_to_data_url(self, svg_text: str) -> str:
+        encoded = base64.b64encode(svg_text.encode("utf-8")).decode("utf-8")
+        return f"data:image/svg+xml;base64,{encoded}"
+
+    def _render_snapshot(self, snapshot: Dict[str, Any], prefix: str, title: str) -> tuple[str, str]:
+        filename = f"{prefix}-turn-{self.turn_id:03d}.svg"
+        path = os.path.join(self.render_dir, filename)
+        svg_text = self._canvas_to_svg(snapshot=snapshot, title=title)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+        return path, self._svg_to_data_url(svg_text)
+
     def step(
         self,
         action: Action,
@@ -184,7 +309,14 @@ class CanvasCRUDEnv:
             tool_obs = f"Unknown action {action.name}"
 
         rendered_canvas = canvas_snapshot(self.data)
+        self.turn_id += 1
+        rendered_image_path, rendered_image_url = self._render_snapshot(
+            snapshot=rendered_canvas,
+            prefix="rendered",
+            title=f"Rendered Canvas Turn {self.turn_id}",
+        )
         current_hash = self._data_hash(self.data)
+        matches_target: Optional[bool] = (current_hash == self.gt_hash) if self.gt_hash else None
         answer_text = str((parsed_assistant or {}).get("answer", "")).strip()
         has_answer = bool(answer_text)
         answer_eval: Dict[str, Any]
@@ -211,11 +343,11 @@ class CanvasCRUDEnv:
             "tool_result": tool_obs,
             "target_canvas": self.target_canvas,
             "rendered_canvas": rendered_canvas,
-            "target_render": json.dumps(self.target_canvas, ensure_ascii=False, sort_keys=True),
-            "rendered_render": json.dumps(rendered_canvas, ensure_ascii=False, sort_keys=True),
-            "target_image": json.dumps(self.target_canvas, ensure_ascii=False, sort_keys=True),
-            "rendered_image": json.dumps(rendered_canvas, ensure_ascii=False, sort_keys=True),
-            "matches_target": current_hash == self.gt_hash,
+            "target_image_path": self.target_image_path,
+            "target_image_url": self.target_image_url,
+            "rendered_image_path": rendered_image_path,
+            "rendered_image_url": rendered_image_url,
+            "matches_target": matches_target,
             "action_terminated": action_done,
             "answer_evaluation": answer_eval,
         }
@@ -244,10 +376,24 @@ class CanvasCRUDEnv:
                 "FEEDBACK: <next-step feedback or closure>"
             )
 
-        obs = self.critic.step(assistant_message=assistant_message, context=critic_context)
+        critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
         info.source = "critic"
 
-        critic_verdict = self._parse_critic_verdict(obs) if has_answer else None
+        # Canvas-style assistant feedback bundle: include render result and critique.
+        assistant_feedback_payload = {
+            "type": "turn_feedback_bundle",
+            "tool_response": tool_obs,
+            "rendered_canvas": rendered_canvas,
+            "target_canvas": self.target_canvas,
+            "rendered_image_path": rendered_image_path,
+            "rendered_image_url": rendered_image_url,
+            "target_image_path": self.target_image_path,
+            "target_image_url": self.target_image_url,
+            "critic_feedback": critic_feedback,
+        }
+        obs = json.dumps(assistant_feedback_payload, ensure_ascii=False)
+
+        critic_verdict = self._parse_critic_verdict(critic_feedback) if has_answer else None
         done = bool(has_answer and critic_verdict is True)
         if has_answer:
             critic_context["critic_verdict"] = critic_verdict

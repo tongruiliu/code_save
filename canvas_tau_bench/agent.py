@@ -18,6 +18,80 @@ THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 TOOL_RE = re.compile(r"<tool>(.*?)</tool>", re.IGNORECASE | re.DOTALL)
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 FUNC_STYLE_RE = re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", re.DOTALL)
+CRITIQUE_PROMPT = "<tool_response><image>This is the state of notebook. Critical Check: {critical_check}</tool_response>"
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "".join(parts).strip()
+    return str(content)
+
+
+def _image_part(url: str) -> Dict[str, Any]:
+    return {
+        "type": "image_url",
+        "image_url": {"url": url},
+    }
+
+
+def _user_message(content: Any) -> Dict[str, Any]:
+    return {"role": "user", "content": content}
+
+
+def _observation_to_user_messages(observation: str) -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(observation)
+    except json.JSONDecodeError:
+        return [_user_message(observation)]
+    if not isinstance(payload, dict):
+        return [_user_message(observation)]
+
+    msg_type = str(payload.get("type", "")).strip()
+    if msg_type == "init_bundle":
+        instruction = str(payload.get("instruction", "")).strip()
+        critic_feedback = str(payload.get("critic_feedback", "")).strip()
+        text_lines: List[str] = []
+        if instruction:
+            text_lines.append(f"Task: {instruction}")
+        if critic_feedback:
+            text_lines.append(critic_feedback)
+        text_block = "\n".join(text_lines).strip() or observation
+        content: List[Dict[str, Any]] = [{"type": "text", "text": text_block}]
+        target_image_url = str(payload.get("target_image_url", "")).strip()
+        if target_image_url:
+            content.append(_image_part(target_image_url))
+        return [_user_message(content)]
+
+    if msg_type == "turn_feedback_bundle":
+        tool_response = str(payload.get("tool_response", "")).strip()
+        critic_feedback = str(payload.get("critic_feedback", "")).strip()
+        user_messages: List[Dict[str, Any]] = []
+        if tool_response and tool_response.startswith("Error:"):
+            user_messages.append(_user_message([
+                {"type": "text", "text": f"<tool_response>{tool_response}</tool_response>"},
+            ]))
+
+        rendered_image_url = str(payload.get("rendered_image_url", "")).strip()
+        if rendered_image_url:
+            user_messages.append(_user_message([_image_part(rendered_image_url)]))
+        if critic_feedback:
+            user_messages.append(_user_message([
+                {
+                    "type": "text",
+                    "text": CRITIQUE_PROMPT.format(critical_check=critic_feedback),
+                }
+            ]))
+        if not user_messages:
+            user_messages.append(_user_message(observation))
+        return user_messages
+
+    return [_user_message(observation)]
 
 
 def _extract_first_tag(text: str, pattern: re.Pattern[str]) -> str:
@@ -69,7 +143,7 @@ def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[st
 
 
 def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
-    content = (message.get("content") or "").strip()
+    content = _message_content_to_text(message.get("content")).strip()
     think = _extract_first_tag(content, THINK_RE)
     raw_tool = _extract_first_tag(content, TOOL_RE)
     answer = _extract_first_tag(content, ANSWER_RE)
@@ -86,6 +160,13 @@ def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
         "raw_tool": raw_tool,
     }
     return action, parsed
+
+
+def strip_think_for_history(text: str) -> str:
+    # Follow Canvas-CoT style: keep content after </think> as the assistant trace.
+    if "</think>" in text:
+        return text.split("</think>")[-1].strip()
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 class ToolCallingAgent:
@@ -105,13 +186,10 @@ class ToolCallingAgent:
 
     def solve(self, env: Any, task_index: Optional[int] = None, max_num_steps: int = 30) -> SolveResult:
         reset_res = env.reset(task_index=task_index)
-        obs = reset_res.observation
         info = reset_res.info.to_dict()
 
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.wiki},
-            {"role": "user", "content": obs},
-        ]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": self.wiki}]
+        messages.extend(_observation_to_user_messages(reset_res.observation))
 
         reward = 0.0
         total_cost = 0.0
@@ -128,10 +206,12 @@ class ToolCallingAgent:
             total_cost += (res._hidden_params.get("response_cost") or 0.0)
 
             action, parsed = message_to_action(next_message)
-            assistant_content = next_message.get("content") or ""
+            assistant_raw = _message_content_to_text(next_message.get("content") or "")
+            assistant_visible = strip_think_for_history(assistant_raw)
+
             env_res = env.step(
                 action=action,
-                assistant_message=assistant_content,
+                assistant_message=assistant_raw,
                 parsed_assistant=parsed,
             )
             reward = env_res.reward
@@ -139,7 +219,8 @@ class ToolCallingAgent:
 
             turns.append(
                 {
-                    "assistant_raw": assistant_content,
+                    "assistant_raw": assistant_raw,
+                    "assistant_visible": assistant_visible,
                     "assistant_think": parsed.get("think", ""),
                     "assistant_tool": parsed.get("tool"),
                     "assistant_answer": parsed.get("answer", ""),
@@ -152,13 +233,11 @@ class ToolCallingAgent:
 
             if env_res.done:
                 # Keep terminal trajectories ending at assistant output for SFT slicing.
-                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "assistant", "content": assistant_visible})
                 break
 
-            messages.extend([
-                {"role": "assistant", "content": assistant_content},
-                {"role": "user", "content": env_res.observation},
-            ])
+            messages.append({"role": "assistant", "content": assistant_visible})
+            messages.extend(_observation_to_user_messages(env_res.observation))
 
         return SolveResult(
             reward=reward,
