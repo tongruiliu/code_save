@@ -74,7 +74,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
         return (
             "You are evaluated by a critic in a visual reasoning loop. "
             f"Task: {self.instruction} "
-            "For non-final turns: provide <think>...</think>; use exactly one <tool>...</tool> if an edit is needed. "
+            "For non-final turns: provide <think>...</think>; use exactly one <tool_call>...</tool_call> if an edit is needed. "
             "For final turn: output only <answer>\\boxed{final_answer}</answer> with no extra text."
         )
 
@@ -278,7 +278,7 @@ class LLMUserSimulation(BaseUserSimulation):
         self.target_canvas = dict(target_canvas or {})
         self.target_image_url = str(target_image_url or "")
         return (
-            "Proceed step by step. Each non-final turn should include one <think> and at most one <tool>. "
+            "Proceed step by step. Each non-final turn should include one <think> and at most one <tool_call>. "
             "Final turn must be answer-only: <answer>\\boxed{final_answer}</answer>."
         )
 

@@ -15,6 +15,7 @@ from .types import (
 
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.IGNORECASE | re.DOTALL)
 TOOL_RE = re.compile(r"<tool>(.*?)</tool>", re.IGNORECASE | re.DOTALL)
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 FUNC_STYLE_RE = re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$", re.DOTALL)
@@ -110,6 +111,8 @@ def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[st
             name = obj.get("name") or obj.get("tool") or obj.get("action")
             args = obj.get("args")
             if args is None:
+                args = obj.get("arguments")
+            if args is None:
                 args = obj.get("kwargs") or obj.get("parameters") or {}
             if isinstance(args, str):
                 try:
@@ -145,7 +148,9 @@ def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[st
 def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
     content = _message_content_to_text(message.get("content")).strip()
     think = _extract_first_tag(content, THINK_RE)
-    raw_tool = _extract_first_tag(content, TOOL_RE)
+    raw_tool_call = _extract_first_tag(content, TOOL_CALL_RE)
+    raw_tool_legacy = _extract_first_tag(content, TOOL_RE)
+    raw_tool = raw_tool_call or raw_tool_legacy
     answer = _extract_first_tag(content, ANSWER_RE)
 
     action, tool_obj = _parse_tool_block(raw_tool)
@@ -157,6 +162,7 @@ def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
         "think": think,
         "tool": tool_obj,
         "answer": answer,
+        "raw_tool_call": raw_tool_call,
         "raw_tool": raw_tool,
     }
     return action, parsed

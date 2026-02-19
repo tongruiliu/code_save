@@ -9,7 +9,7 @@ A standalone minimal implementation independent of `tau-bench`:
 ## Structure
 
 - `run.py`: Entry script, benchmark execution, and SFT JSONL export.
-- `agent.py`: Policy agent that parses `<think>/<tool>/<answer>` from assistant outputs.
+- `agent.py`: Policy agent that parses `<think>/<tool_call>/<answer>` from assistant outputs.
 - `env.py`: Canvas CRUD environment, critic feedback loop, and reward logic.
 - `tools.py`: Canvas CRUD tool definitions and execution.
 - `user.py`: Critic simulator with `scripted / human / llm` strategies.
@@ -21,7 +21,7 @@ A standalone minimal implementation independent of `tau-bench`:
 - `user`: The critic providing turn-level feedback.
 - The assistant is expected to output:
   - Non-final turns should include `<think>...</think>` and advance only one step
-  - `<tool>{"name":"...","args":{...}}</tool>` when executing one CRUD action for that step
+  - `<tool_call>{"name":"...","arguments":{...}}</tool_call>` when executing one CRUD action for that step
   - Final answer only as `<answer>\boxed{final_answer}</answer>` (also accepts `/boxed{...}` for compatibility)
   - Do not include extra text inside `<answer>` beyond the boxed payload
   - Do not include extra text outside `<answer>` in the final turn
@@ -44,7 +44,7 @@ Example assistant turn:
 
 ```text
 <think>I should insert the first node under root.</think>
-<tool>{"name":"insert_element","args":{"fragment":"<div id='plan'>draft</div>","rootId":"root"}}</tool>
+<tool_call>{"name":"insert_element","arguments":{"fragment":"<div id='plan'>draft</div>","rootId":"root"}}</tool_call>
 ```
 
 Example final answer:
