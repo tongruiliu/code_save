@@ -29,7 +29,7 @@ A standalone minimal implementation independent of `tau-bench`:
 - Each non-terminal round feeds assistant with a `turn_feedback_bundle` that contains:
   - `tool_response`
   - `rendered_canvas` and `target_canvas`
-  - `rendered_image_url` (SVG data URL for the latest render)
+  - `rendered_image_url` (PNG data URL for the latest render)
   - `critic_feedback`
 - The first assistant turn is initialized with an `init_bundle` that includes the target image (`target_image_url`).
 - Target image is expected to come from task input (`target_image_url` or `target_image_path`) in Canvas-style multimodal setup.
@@ -66,7 +66,10 @@ FEEDBACK: ...
 ```bash
 cd /m2/slz/lrt/canvas_tau_bench
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
+
+`python -m playwright install chromium` is required. Installing Python packages alone is not enough.
 
 ## Run
 
@@ -109,5 +112,5 @@ python /m2/slz/lrt/canvas_tau_bench/run.py \
 - By default, results are saved as:
   - `*.json`: full trajectories and reward metadata
   - `*.sft.jsonl`: assistant-turn SFT records (`messages` + `assistant_target` + `turn_meta`)
-- Target and per-turn rendered snapshots are exported as SVG files and also passed as `data:image/svg+xml;base64,...` URLs for multimodal inputs.
+- Target and per-turn rendered snapshots are exported as PNG files and passed as `data:image/png;base64,...` URLs for multimodal inputs.
 - For answer turns, critic context includes `answer_check` with `gold_answers` and boxed model answer, enabling semantic-equivalence judgement (e.g., `0.5 == 1/2`).

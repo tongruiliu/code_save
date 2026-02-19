@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any, Dict, List
 
+from bs4 import BeautifulSoup
+
 
 def init_canvas_data() -> Dict[str, Any]:
     return {
@@ -32,6 +34,26 @@ def _extract_tag(fragment: str) -> str:
 def _extract_id(fragment: str) -> str | None:
     m = re.search(r"\bid\s*=\s*[\"']([^\"']+)[\"']", fragment)
     return m.group(1) if m else None
+
+
+def _parse_fragment(fragment: str) -> tuple[str, str | None, Dict[str, Any], str]:
+    try:
+        soup = BeautifulSoup(fragment, "html.parser")
+        tag = soup.find()
+        if tag is None:
+            return "unknown", None, {}, ""
+        node_id = tag.get("id")
+        attrs: Dict[str, Any] = {}
+        for k, v in dict(tag.attrs).items():
+            if isinstance(v, list):
+                attrs[str(k)] = " ".join(str(x) for x in v)
+            else:
+                attrs[str(k)] = str(v)
+        attrs.pop("id", None)
+        text = str(tag.string) if tag.string is not None else ""
+        return str(tag.name), (str(node_id) if node_id is not None else None), attrs, text
+    except Exception:
+        return _extract_tag(fragment), _extract_id(fragment), {}, ""
 
 
 def _get_nodes(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -89,7 +111,7 @@ class InsertElement(Tool):
         if rootId not in nodes:
             return f"Error: rootId '{rootId}' not found"
 
-        node_id = _extract_id(fragment)
+        tag, node_id, parsed_attrs, parsed_text = _parse_fragment(fragment)
         if node_id is None:
             return "Error: fragment must include an id attribute"
         if node_id in nodes:
@@ -97,12 +119,12 @@ class InsertElement(Tool):
 
         new_node = {
             "id": node_id,
-            "tag": _extract_tag(fragment),
+            "tag": tag,
             "fragment": fragment,
             "parent": rootId,
             "children": [],
-            "attrs": {},
-            "text": "",
+            "attrs": parsed_attrs,
+            "text": parsed_text,
         }
         nodes[node_id] = new_node
 
@@ -209,7 +231,8 @@ class ReplaceElement(Tool):
         if parent_id is None:
             return "Error: root cannot be replaced"
 
-        new_id = _extract_id(fragment) or targetId
+        new_tag, new_id, parsed_attrs, parsed_text = _parse_fragment(fragment)
+        new_id = new_id or targetId
         if new_id != targetId and new_id in nodes:
             return f"Error: id '{new_id}' already exists"
 
@@ -218,12 +241,12 @@ class ReplaceElement(Tool):
 
         replacement = {
             "id": new_id,
-            "tag": _extract_tag(fragment),
+            "tag": new_tag,
             "fragment": fragment,
             "parent": parent_id,
             "children": old_node["children"],
-            "attrs": {},
-            "text": "",
+            "attrs": parsed_attrs,
+            "text": parsed_text,
         }
 
         del nodes[targetId]

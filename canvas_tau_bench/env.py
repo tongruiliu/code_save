@@ -10,6 +10,9 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional, Type
 
+from bs4 import BeautifulSoup, NavigableString
+from playwright.sync_api import Browser, Playwright, sync_playwright
+
 from .tools import ALL_TOOLS, Tool, canvas_snapshot, init_canvas_data
 from .types import (
     Action,
@@ -138,6 +141,8 @@ class CanvasCRUDEnv:
         self.actions: List[Action] = []
         self.assistant_messages: List[str] = []
         self.answer_history: List[str] = []
+        self._playwright: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
 
     def reset(self, task_index: Optional[int] = None) -> EnvResetResponse:
         if task_index is not None:
@@ -285,51 +290,190 @@ class CanvasCRUDEnv:
             return False
         return None
 
-    def _flatten_canvas_lines(self, node: Dict[str, Any], depth: int, lines: List[str]) -> None:
-        indent = "  " * depth
-        node_id = str(node.get("id", ""))
-        tag = str(node.get("tag", ""))
-        text_val = str(node.get("text", "")).strip()
-        attrs = node.get("attrs", {}) or {}
-        attrs_str = ""
-        if attrs:
-            attrs_parts = [f"{k}={v}" for k, v in attrs.items()]
-            attrs_str = " attrs[" + ", ".join(attrs_parts) + "]"
-        text_str = f" text[{text_val}]" if text_val else ""
-        lines.append(f"{indent}- {node_id}<{tag}>{attrs_str}{text_str}")
-        for child in node.get("children", []):
-            self._flatten_canvas_lines(child, depth + 1, lines)
+    def _ensure_browser(self) -> None:
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        if self._browser is None:
+            self._browser = self._playwright.chromium.launch(headless=True)
 
-    def _canvas_to_svg(self, snapshot: Dict[str, Any], title: str) -> str:
-        lines: List[str] = [title]
-        self._flatten_canvas_lines(snapshot, depth=0, lines=lines)
-        row_h = 22
-        width = 1200
-        height = max(180, 40 + row_h * len(lines))
-        svg_lines = [
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
-            f'<rect x="0" y="0" width="{width}" height="{height}" fill="white" stroke="#dddddd" />',
-        ]
-        for idx, line in enumerate(lines):
-            y = 28 + idx * row_h
-            safe = html.escape(line)
-            svg_lines.append(
-                f'<text x="12" y="{y}" font-family="monospace" font-size="14" fill="#222222">{safe}</text>'
+    def _close_browser(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+    def __del__(self) -> None:
+        self._close_browser()
+
+    def _html_shell(self, title: str, body_html: str) -> str:
+        safe_title = html.escape(title)
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{safe_title}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      padding: 24px;
+      background: #eef2f7;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #222;
+    }}
+    .sheet {{
+      width: 820px;
+      min-height: 480px;
+      margin: 0 auto;
+      background: #fff;
+      border: 1px solid #d8dee9;
+      border-radius: 10px;
+      padding: 16px;
+      box-shadow: 0 8px 20px rgba(20, 27, 45, 0.08);
+      overflow: hidden;
+    }}
+    .title {{
+      font-size: 14px;
+      color: #5a6578;
+      margin-bottom: 12px;
+    }}
+    #root {{
+      width: 100%;
+      min-height: 380px;
+    }}
+    svg {{
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }}
+  </style>
+</head>
+<body>
+  <main class="sheet">
+    <div class="title">{safe_title}</div>
+    {body_html}
+  </main>
+</body>
+</html>"""
+
+    def _snapshot_node_to_html(self, node: Dict[str, Any]) -> str:
+        tag = str(node.get("tag", "div") or "div")
+        node_id = str(node.get("id", "") or "")
+        attrs = dict(node.get("attrs", {}) or {})
+        text = str(node.get("text", "") or "")
+        children = node.get("children", []) or []
+
+        attr_parts: List[str] = []
+        if node_id:
+            attr_parts.append(f'id="{html.escape(node_id, quote=True)}"')
+        for k, v in attrs.items():
+            if k == "id":
+                continue
+            attr_parts.append(
+                f'{html.escape(str(k), quote=True)}="{html.escape(str(v), quote=True)}"'
             )
-        svg_lines.append("</svg>")
-        return "".join(svg_lines)
+        attrs_str = (" " + " ".join(attr_parts)) if attr_parts else ""
+        children_html = "".join(self._snapshot_node_to_html(c) for c in children)
+        text_html = html.escape(text)
+        return f"<{tag}{attrs_str}>{text_html}{children_html}</{tag}>"
 
-    def _svg_to_data_url(self, svg_text: str) -> str:
-        encoded = base64.b64encode(svg_text.encode("utf-8")).decode("utf-8")
-        return f"data:image/svg+xml;base64,{encoded}"
+    def _node_tag_from_fragment(self, fragment: str, fallback_tag: str, node_id: str) -> Any:
+        tag = None
+        try:
+            parsed = BeautifulSoup(fragment or "", "html.parser")
+            tag = parsed.find()
+        except Exception:
+            tag = None
+        if tag is None:
+            parsed = BeautifulSoup("", "html.parser")
+            tag = parsed.new_tag(fallback_tag or "div")
+        tag["id"] = node_id
+        return tag
 
-    def _render_snapshot(self, snapshot: Dict[str, Any], prefix: str, title: str) -> tuple[str, str]:
-        filename = f"{prefix}-turn-{self.turn_id:03d}.svg"
+    def _data_node_to_html(self, nodes: Dict[str, Dict[str, Any]], node_id: str) -> str:
+        node = nodes[node_id]
+        tag = self._node_tag_from_fragment(
+            fragment=str(node.get("fragment", "")),
+            fallback_tag=str(node.get("tag", "div")),
+            node_id=str(node.get("id", node_id)),
+        )
+
+        attrs = dict(node.get("attrs", {}) or {})
+        for k, v in attrs.items():
+            if k == "id":
+                continue
+            if isinstance(v, (dict, list)):
+                tag[str(k)] = json.dumps(v, ensure_ascii=False)
+            else:
+                tag[str(k)] = str(v)
+
+        children_ids = list(node.get("children", []) or [])
+        for child_id in children_ids:
+            if child_id not in nodes:
+                continue
+            child_html = self._data_node_to_html(nodes, child_id)
+            child_tag = BeautifulSoup(child_html, "html.parser").find()
+            if child_tag is not None:
+                tag.append(child_tag)
+
+        text_val = str(node.get("text", ""))
+        if text_val:
+            if children_ids:
+                tag.insert(0, NavigableString(text_val))
+            else:
+                tag.string = text_val
+
+        return str(tag)
+
+    def _render_html_to_png(self, html_text: str, output_path: str) -> None:
+        self._ensure_browser()
+        assert self._browser is not None
+        page = self._browser.new_page(
+            viewport={"width": 1200, "height": 900},
+            device_scale_factor=2,
+        )
+        try:
+            page.set_content(html_text, wait_until="load")
+            page.screenshot(path=output_path, full_page=True)
+        finally:
+            page.close()
+
+    def _file_to_data_url(self, path: str, mime: str = "image/png") -> str:
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:{mime};base64,{encoded}"
+
+    def _render_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        prefix: str,
+        title: str,
+        data_state: Optional[Dict[str, Any]] = None,
+    ) -> tuple[str, str]:
+        filename = f"{prefix}-turn-{self.turn_id:03d}.png"
         path = os.path.join(self.render_dir, filename)
-        svg_text = self._canvas_to_svg(snapshot=snapshot, title=title)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(svg_text)
-        return path, self._svg_to_data_url(svg_text)
+
+        if data_state is not None and isinstance(data_state, dict):
+            try:
+                nodes = ((data_state.get("canvas") or {}).get("nodes") or {})
+                body_html = self._data_node_to_html(nodes, "root") if "root" in nodes else "<div id='root'></div>"
+            except Exception:
+                body_html = self._snapshot_node_to_html(snapshot)
+        else:
+            body_html = self._snapshot_node_to_html(snapshot)
+
+        html_text = self._html_shell(title=title, body_html=body_html)
+        self._render_html_to_png(html_text, path)
+        return path, self._file_to_data_url(path, mime="image/png")
 
     def step(
         self,
@@ -361,6 +505,7 @@ class CanvasCRUDEnv:
             snapshot=rendered_canvas,
             prefix="rendered",
             title=f"Rendered Canvas Turn {self.turn_id}",
+            data_state=self.data,
         )
         current_hash = self._data_hash(self.data)
         matches_target: Optional[bool] = (current_hash == self.gt_hash) if self.gt_hash else None

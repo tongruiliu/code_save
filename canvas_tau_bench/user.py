@@ -290,7 +290,6 @@ class LLMUserSimulation(BaseUserSimulation):
 
         text_blocks = [
             f"Question: {self.instruction}",
-            f"Assistant turn: {assistant_message}",
         ]
         if self.target_canvas:
             text_blocks.append(
