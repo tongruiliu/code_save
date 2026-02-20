@@ -15,11 +15,11 @@ if __package__ is None or __package__ == "":
     import sys
 
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-    from canvas_tau_bench.agent import ToolCallingAgent
+    from canvas_tau_bench.agent import ToolCallingAgent, strip_think_for_history
     from canvas_tau_bench.env import CanvasCRUDEnv
     from canvas_tau_bench.types import Action, EnvRunResult, Task
 else:
-    from .agent import ToolCallingAgent
+    from .agent import ToolCallingAgent, strip_think_for_history
     from .env import CanvasCRUDEnv
     from .types import Action, EnvRunResult, Task
 
@@ -202,6 +202,26 @@ def display_metrics(results: List[EnvRunResult]) -> None:
         print(f"  k={k}: {total / len(c_per_task_id):.4f}")
 
 
+def display_costs(results: List[EnvRunResult]) -> None:
+    model_cost_sum = 0.0
+    critic_cost_sum = 0.0
+    total_cost_sum = 0.0
+
+    for r in results:
+        info = r.info if isinstance(r.info, dict) else {}
+        model_cost = float(info.get("model_cost") or 0.0)
+        critic_cost = float(info.get("user_cost") or 0.0)
+        total_cost = float(info.get("total_cost") or (model_cost + critic_cost))
+        model_cost_sum += model_cost
+        critic_cost_sum += critic_cost
+        total_cost_sum += total_cost
+
+    print("Cost (USD)")
+    print(f"  policy_model: {model_cost_sum:.6f}")
+    print(f"  critic_model: {critic_cost_sum:.6f}")
+    print(f"  total: {total_cost_sum:.6f}")
+
+
 def build_sft_records(result: EnvRunResult) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     turns = result.info.get("turns", []) if isinstance(result.info, dict) else []
@@ -210,15 +230,34 @@ def build_sft_records(result: EnvRunResult) -> List[Dict[str, Any]]:
     for i, msg in enumerate(result.traj):
         if msg.get("role") != "assistant":
             continue
+        prefix_messages = []
+        for prefix_msg in result.traj[:i]:
+            if prefix_msg.get("role") == "assistant":
+                content = prefix_msg.get("content", "")
+                if isinstance(content, str):
+                    prefix_messages.append({
+                        "role": "assistant",
+                        "content": strip_think_for_history(content),
+                    })
+                else:
+                    prefix_messages.append(prefix_msg)
+            else:
+                prefix_messages.append(prefix_msg)
+
+        assistant_target = msg.get("content", "")
         record: Dict[str, Any] = {
             "task_id": result.task_id,
             "trial": result.trial,
             "reward": result.reward,
-            "messages": result.traj[:i],
-            "assistant_target": msg.get("content", ""),
+            "messages": prefix_messages,
+            "assistant_target": assistant_target,
         }
         if assistant_turn_idx < len(turns):
-            record["turn_meta"] = turns[assistant_turn_idx]
+            turn_meta = turns[assistant_turn_idx]
+            record["turn_meta"] = turn_meta
+            raw_target = turn_meta.get("assistant_raw", "")
+            if isinstance(raw_target, str) and raw_target.strip():
+                record["assistant_target"] = raw_target
         records.append(record)
         assistant_turn_idx += 1
 
@@ -239,12 +278,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Standalone canvas-CRUD tau-style benchmark")
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--model-provider", type=str, required=True, choices=provider_list)
+    p.add_argument("--api-base-url", type=str, default=None)
+    p.add_argument("--api-key", type=str, default=None)
+    p.add_argument("--max-tokens", "--policy-max-tokens", dest="max_tokens", type=int, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max-steps", type=int, default=30)
 
     p.add_argument("--user-strategy", type=str, default="scripted", choices=["scripted", "human", "llm"])
     p.add_argument("--user-model", type=str, default="gpt-4o-mini")
     p.add_argument("--user-model-provider", type=str, default="openai")
+    p.add_argument("--user-api-base-url", type=str, default=None)
+    p.add_argument("--user-api-key", type=str, default=None)
+    p.add_argument("--user-max-tokens", "--critic-max-tokens", dest="user_max_tokens", type=int, default=None)
 
     p.add_argument("--num-trials", type=int, default=1)
     p.add_argument("--task-ids", type=int, nargs="+", default=None)
@@ -298,6 +343,9 @@ def main() -> None:
         user_strategy=args.user_strategy,
         user_model=args.user_model,
         user_provider=args.user_model_provider,
+        user_api_base_url=args.user_api_base_url or args.api_base_url,
+        user_api_key=args.user_api_key,
+        user_max_tokens=args.user_max_tokens,
     )
     agent = ToolCallingAgent(
         tools_info=template_env.tools_info,
@@ -305,6 +353,9 @@ def main() -> None:
         model=args.model,
         provider=args.model_provider,
         temperature=args.temperature,
+        api_base_url=args.api_base_url,
+        api_key=args.api_key,
+        max_tokens=args.max_tokens,
     )
 
     results: List[EnvRunResult] = []
@@ -320,13 +371,22 @@ def main() -> None:
                 user_strategy=args.user_strategy,
                 user_model=args.user_model,
                 user_provider=args.user_model_provider,
+                user_api_base_url=args.user_api_base_url or args.api_base_url,
+                user_api_key=args.user_api_key,
+                user_max_tokens=args.user_max_tokens,
             )
             try:
                 solve_res = agent.solve(env=env, task_index=idx, max_num_steps=args.max_steps)
+                info = dict(solve_res.info or {})
+                model_cost = float(getattr(solve_res, "total_cost", 0.0) or 0.0)
+                user_cost = float(info.get("user_cost") or 0.0)
+                info["model_cost"] = model_cost
+                info["user_cost"] = user_cost
+                info["total_cost"] = model_cost + user_cost
                 result = EnvRunResult(
                     task_id=idx,
                     reward=solve_res.reward,
-                    info=solve_res.info,
+                    info=info,
                     traj=solve_res.messages,
                     trial=trial,
                 )
@@ -334,7 +394,13 @@ def main() -> None:
                 result = EnvRunResult(
                     task_id=idx,
                     reward=0.0,
-                    info={"error": str(exc), "traceback": traceback.format_exc()},
+                    info={
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "model_cost": 0.0,
+                        "user_cost": 0.0,
+                        "total_cost": 0.0,
+                    },
                     traj=[],
                     trial=trial,
                 )
@@ -343,6 +409,7 @@ def main() -> None:
             results.append(result)
 
     display_metrics(results)
+    display_costs(results)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump([r.to_dict() for r in results], f, ensure_ascii=False, indent=2)

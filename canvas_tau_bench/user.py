@@ -1,12 +1,96 @@
 from __future__ import annotations
 
 import abc
+import base64
 from fractions import Fraction
 import json
+import mimetypes
+import os
 import re
 from typing import Any, Dict, List, Optional
 
 from litellm import completion
+
+
+VERDICT_CORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*CORRECT\s*$", re.IGNORECASE | re.MULTILINE)
+VERDICT_INCORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*INCORRECT\s*$", re.IGNORECASE | re.MULTILINE)
+REASON_LINE_RE = re.compile(r"^\s*REASON\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+FEEDBACK_LINE_RE = re.compile(r"^\s*FEEDBACK\s*:\s*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _usage_to_dict(usage: Any) -> Dict[str, int]:
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or (prompt_tokens + completion_tokens))
+    if prompt_tokens == 0 and completion_tokens == 0 and total_tokens == 0:
+        return {}
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _path_or_url_to_data_url(value: str, cache: Dict[str, str]) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return v
+    if v.startswith(("data:", "http://", "https://")):
+        return v
+    path = v[7:] if v.startswith("file://") else v
+    if not os.path.exists(path):
+        return v
+    if path in cache:
+        return cache[path]
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".svg":
+            mime = "image/svg+xml"
+        elif ext in {".jpg", ".jpeg"}:
+            mime = "image/jpeg"
+        elif ext == ".webp":
+            mime = "image/webp"
+        else:
+            mime = "image/png"
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    data_url = f"data:{mime};base64,{encoded}"
+    cache[path] = data_url
+    return data_url
+
+
+def _materialize_messages_for_model(messages: List[Dict[str, Any]], cache: Dict[str, str]) -> List[Dict[str, Any]]:
+    materialized: List[Dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_content: List[Any] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    image_obj = dict(item.get("image_url", {}) or {})
+                    url_val = str(image_obj.get("url", "") or "").strip()
+                    image_obj["url"] = _path_or_url_to_data_url(url_val, cache)
+                    new_item = dict(item)
+                    new_item["image_url"] = image_obj
+                    new_content.append(new_item)
+                else:
+                    new_content.append(item)
+            materialized.append({"role": msg.get("role"), "content": new_content})
+        else:
+            materialized.append(msg)
+    return materialized
 
 
 class BaseUserSimulation(abc.ABC):
@@ -25,6 +109,10 @@ class BaseUserSimulation(abc.ABC):
 
     @abc.abstractmethod
     def get_total_cost(self) -> float:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_last_usage(self) -> Dict[str, int]:
         raise NotImplementedError
 
 
@@ -57,6 +145,9 @@ class HumanUserSimulation(BaseUserSimulation):
     def get_total_cost(self) -> float:
         return 0.0
 
+    def get_last_usage(self) -> Dict[str, int]:
+        return {}
+
 
 class ScriptedUserSimulation(BaseUserSimulation):
     def __init__(self) -> None:
@@ -74,7 +165,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
         return (
             "You are evaluated by a critic in a visual reasoning loop. "
             f"Task: {self.instruction} "
-            "For non-final turns: provide <think>...</think>; use exactly one <tool_call>...</tool_call> if an edit is needed. "
+            "For non-final turns: provide <think>...</think> and exactly one <tool_call>...</tool_call>. "
             "For final turn: output only <answer>\\boxed{final_answer}</answer> with no extra text."
         )
 
@@ -147,6 +238,13 @@ class ScriptedUserSimulation(BaseUserSimulation):
         has_match_signal = isinstance(matches_target_raw, bool)
         matches_target = bool(matches_target_raw)
         action_terminated = bool(context.get("action_terminated"))
+        policy_format_error = str(context.get("policy_format_error", "") or "").strip()
+
+        if policy_format_error and not has_answer:
+            return (
+                "Policy format violation: non-final turn must contain exactly one valid "
+                "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. Retry one CRUD action."
+            )
 
         if has_answer:
             model_answer = str(answer_check.get("model_answer_boxed", ""))
@@ -196,36 +294,109 @@ class ScriptedUserSimulation(BaseUserSimulation):
     def get_total_cost(self) -> float:
         return 0.0
 
+    def get_last_usage(self) -> Dict[str, int]:
+        return {}
+
 
 class LLMUserSimulation(BaseUserSimulation):
-    def __init__(self, model: str, provider: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        provider: str,
+        api_base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> None:
         self.model = model
         self.provider = provider
+        self.api_base_url = (api_base_url or "").strip()
+        self.api_key = (api_key or "").strip()
+        self.max_tokens = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
         self.total_cost = 0.0
+        self.last_usage: Dict[str, int] = {}
+        self._image_data_cache: Dict[str, str] = {}
         self.instruction: str = ""
         self.target_canvas: Dict[str, Any] = {}
         self.target_image_url: str = ""
 
     def _build_system_prompt(self) -> str:
         return (
-            "You are a strict visual-task critic in a multi-turn loop.\n"
-            "Rules:\n"
-            "- Treat the assistant as the policy being trained for SFT distillation.\n"
-            "- Control multi-turn behavior through your feedback: one step per turn.\n"
-            "- Non-final turns should contain one concise think and at most one tool call.\n"
-            "- Final turn must be answer-only: <answer>\\boxed{final_answer}</answer>.\n"
-            "- You receive target render and current render each turn.\n"
-            "- When answer_check exists, you must judge semantic equivalence intelligently.\n"
-            "- Accept mathematically equivalent answers (e.g., 0.5 == 1/2).\n"
-            "- Accept unitless/unit forms when units are not required by instruction (e.g., 2 == 2m).\n"
-            "- If instruction implies symbol-number mapping, accept mapped equivalents.\n"
-            "- If incorrect, explicitly mention hallucination risk and where the model is wrong.\n"
-            "- For answer turns, output exactly:\n"
+            "You are a strict critic/auditor. You are NOT a tutor.\n"
+            "Hard bans:\n"
+            "- Do NOT solve the problem.\n"
+            "- Do NOT derive equations.\n"
+            "- Do NOT provide calculations or final numeric/letter answers.\n"
+            "- Do NOT explain full reasoning.\n"
+            "Role:\n"
+            "- Only audit hallucination/mismatch and policy-format compliance.\n"
+            "- Give one-step corrective guidance only.\n"
+            "Output policy:\n"
+            "- Non-answer turns: output concise audit feedback in 1-3 sentences.\n"
+            "- Answer turns: output exactly three lines:\n"
             "  VERDICT: CORRECT or VERDICT: INCORRECT\n"
-            "  REASON: <short reason>\n"
-            "  FEEDBACK: <next-step guidance or closure>\n"
-            "- For non-answer turns, output one short actionable feedback sentence."
+            "  REASON: <short audit reason>\n"
+            "  FEEDBACK: <single next action or closure>\n"
+            "- No markdown list, no JSON, no code block, no extra lines."
         )
+
+    def _sanitize_non_answer_feedback(self, text: str) -> str:
+        compact = " ".join(str(text or "").replace("\n", " ").split()).strip()
+        if not compact:
+            return "Audit only: identify one mismatch and request one concrete next CRUD step."
+        upper = compact.upper()
+        if "VERDICT:" in upper:
+            # LLM drifted to answer-turn format; keep non-answer channel short and actionable.
+            compact = "Audit only: identify one mismatch and request one concrete next CRUD step."
+        banned_markers = [
+            "the answer is",
+            "let's solve",
+            "first,",
+            "step 1",
+            "equation",
+            "kinetic energy",
+            "potential energy",
+        ]
+        low = compact.lower()
+        if any(x in low for x in banned_markers):
+            compact = "Audit only: check hallucination/mismatch and request one precise corrective action."
+        # Keep 1-3 concise sentences, avoid long teaching-style feedback.
+        parts = re.split(r"(?<=[\.\!\?])\s+", compact)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) > 3:
+            parts = parts[:3]
+        compact = " ".join(parts).strip()
+        if len(compact) > 360:
+            compact = compact[:360].rsplit(" ", 1)[0].strip()
+        return compact
+
+    def _sanitize_answer_feedback(self, text: str) -> str:
+        raw = str(text or "")
+        verdict = None
+        if VERDICT_CORRECT_RE.search(raw):
+            verdict = "CORRECT"
+        elif VERDICT_INCORRECT_RE.search(raw):
+            verdict = "INCORRECT"
+        else:
+            verdict = "INCORRECT"
+
+        reason_match = REASON_LINE_RE.search(raw)
+        feedback_match = FEEDBACK_LINE_RE.search(raw)
+        reason = (reason_match.group(1).strip() if reason_match else "").strip()
+        feedback = (feedback_match.group(1).strip() if feedback_match else "").strip()
+
+        if not reason:
+            reason = "Audit result could not confirm required answer constraints."
+        if not feedback:
+            feedback = "Provide only compliant output in the required format."
+
+        reason = " ".join(reason.split())
+        feedback = " ".join(feedback.split())
+        if len(reason) > 140:
+            reason = reason[:140].rsplit(" ", 1)[0].strip()
+        if len(feedback) > 140:
+            feedback = feedback[:140].rsplit(" ", 1)[0].strip()
+
+        return f"VERDICT: {verdict}\nREASON: {reason}\nFEEDBACK: {feedback}"
 
     def _as_multimodal_user_content(
         self,
@@ -250,22 +421,45 @@ class LLMUserSimulation(BaseUserSimulation):
     def _message_content_to_text(self, content: Any) -> str:
         if isinstance(content, str):
             return content
+        if isinstance(content, dict):
+            t = content.get("text")
+            if isinstance(t, str):
+                return t
+            return str(content)
         if isinstance(content, list):
             parts: List[str] = []
             for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    item_type = str(item.get("type", "")).strip().lower()
+                    if item_type in {"text", "output_text", "input_text"}:
+                        parts.append(str(item.get("text", "")))
+                        continue
+                    if isinstance(item.get("text"), str):
+                        parts.append(str(item.get("text", "")))
             return "".join(parts).strip()
         return str(content)
 
     def _generate_once(self, messages: List[Dict[str, Any]]) -> str:
+        completion_kwargs: Dict[str, Any] = {}
+        if self.api_base_url:
+            completion_kwargs["api_base"] = self.api_base_url
+        if self.api_key:
+            completion_kwargs["api_key"] = self.api_key
+        if self.max_tokens is not None:
+            completion_kwargs["max_tokens"] = self.max_tokens
+        model_messages = _materialize_messages_for_model(messages, self._image_data_cache)
         res = completion(
             model=self.model,
             custom_llm_provider=self.provider,
-            messages=messages,
+            messages=model_messages,
+            **completion_kwargs,
         )
         msg = res.choices[0].message
         self.total_cost += (res._hidden_params.get("response_cost") or 0.0)
+        self.last_usage = _usage_to_dict(getattr(res, "usage", None))
         return self._message_content_to_text(msg.content)
 
     def reset(
@@ -277,16 +471,37 @@ class LLMUserSimulation(BaseUserSimulation):
         self.instruction = str(instruction or "")
         self.target_canvas = dict(target_canvas or {})
         self.target_image_url = str(target_image_url or "")
+        self.last_usage = {}
+        self._image_data_cache = {}
         return (
-            "Proceed step by step. Each non-final turn should include one <think> and at most one <tool_call>. "
+            "Proceed step by step. Each non-final turn must include one <think> and exactly one <tool_call>. "
             "Final turn must be answer-only: <answer>\\boxed{final_answer}</answer>."
         )
 
     def step(self, assistant_message: str, context: Optional[Dict[str, Any]] = None) -> str:
         ctx = dict(context or {})
         rendered_image_url = str(ctx.get("rendered_image_url", "") or "")
+        rendered_image_path = str(ctx.get("rendered_image_path", "") or "")
+        target_image_path = str(ctx.get("target_image_path", "") or "")
         answer_check = ctx.get("answer_check")
         answer_eval = ctx.get("answer_evaluation")
+        answer_error_notice = str(ctx.get("answer_error_notice", "") or "").strip()
+        policy_format_error = str(ctx.get("policy_format_error", "") or "").strip()
+
+        if policy_format_error and not (isinstance(answer_eval, dict) and answer_eval.get("has_answer")):
+            return (
+                "Policy format violation: non-final turn must include exactly one valid "
+                "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. "
+                "Retry with one concrete CRUD action only."
+            )
+
+        # Hard guard for malformed final-answer format to ensure immediate correction signal.
+        if isinstance(answer_eval, dict) and answer_eval.get("has_answer") and not answer_eval.get("format_ok", False):
+            return (
+                "VERDICT: INCORRECT\n"
+                "REASON: Final answer format is invalid.\n"
+                "FEEDBACK: Output exactly <answer>\\boxed{final_answer}</answer> with no extra text."
+            )
 
         text_blocks = [
             f"Question: {self.instruction}",
@@ -299,6 +514,8 @@ class LLMUserSimulation(BaseUserSimulation):
             text_blocks.append(
                 "Answer evaluation turn: return exactly VERDICT/REASON/FEEDBACK and judge semantic equivalence."
             )
+        if answer_error_notice:
+            text_blocks.append(answer_error_notice)
         if isinstance(answer_check, dict):
             text_blocks.append(
                 "Gold answers: " + json.dumps(answer_check.get("gold_answers", []), ensure_ascii=False)
@@ -306,12 +523,17 @@ class LLMUserSimulation(BaseUserSimulation):
             text_blocks.append(
                 "Model boxed answer: " + str(answer_check.get("model_answer_boxed", ""))
             )
+            text_blocks.append(
+                "Answer format ok: " + str(bool(answer_check.get("answer_format_ok", False)))
+            )
 
         image_urls = []
-        if self.target_image_url:
-            image_urls.append(self.target_image_url)
-        if rendered_image_url:
-            image_urls.append(rendered_image_url)
+        target_ref = self.target_image_url or target_image_path
+        if target_ref:
+            image_urls.append(target_ref)
+        rendered_ref = rendered_image_url or rendered_image_path
+        if rendered_ref:
+            image_urls.append(rendered_ref)
 
         messages = [
             {"role": "system", "content": self._build_system_prompt()},
@@ -323,18 +545,37 @@ class LLMUserSimulation(BaseUserSimulation):
                 ),
             },
         ]
-        return self._generate_once(messages)
+        raw_output = self._generate_once(messages)
+        if isinstance(answer_eval, dict) and answer_eval.get("has_answer"):
+            return self._sanitize_answer_feedback(raw_output)
+        return self._sanitize_non_answer_feedback(raw_output)
 
     def get_total_cost(self) -> float:
         return self.total_cost
 
+    def get_last_usage(self) -> Dict[str, int]:
+        return dict(self.last_usage)
 
-def load_user(strategy: str, model: str, provider: str) -> BaseUserSimulation:
+
+def load_user(
+    strategy: str,
+    model: str,
+    provider: str,
+    api_base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+) -> BaseUserSimulation:
     strategy = strategy.lower()
     if strategy == "human":
         return HumanUserSimulation()
     if strategy == "llm":
-        return LLMUserSimulation(model=model, provider=provider)
+        return LLMUserSimulation(
+            model=model,
+            provider=provider,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            max_tokens=max_tokens,
+        )
     if strategy == "scripted":
         return ScriptedUserSimulation()
     raise ValueError(f"Unknown user strategy: {strategy}")

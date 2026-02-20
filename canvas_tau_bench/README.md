@@ -80,6 +80,8 @@ cd /m2/slz/lrt
 python -m canvas_tau_bench.run \
   --model gpt-4o-mini \
   --model-provider openai \
+  --api-key "$POLICY_API_KEY" \
+  --api-base-url https://your-openai-compatible-endpoint/v1 \
   --user-strategy scripted \
   --num-trials 1
 ```
@@ -96,8 +98,12 @@ python /m2/slz/lrt/canvas_tau_bench/run.py \
 ## Key Arguments
 
 - `--model`, `--model-provider`: Main agent model configuration.
+- `--api-key`, `--api-base-url`: API key and base URL for the policy model.
+- `--max-tokens` (alias: `--policy-max-tokens`): Per-call output token cap for policy.
 - `--user-strategy`: Critic strategy: `scripted` (default), `human`, or `llm`.
 - `--user-model`, `--user-model-provider`: Configuration for the `llm` critic simulator.
+- `--user-api-key`, `--user-api-base-url`: API key and base URL for critic model calls.
+- `--user-max-tokens` (alias: `--critic-max-tokens`): Per-call output token cap for critic.
 - `--task-ids`: Explicit list of task IDs to run.
 - `--num-trials`: Number of repeated trials.
 - `--max-steps`: Maximum dialogue steps per task.

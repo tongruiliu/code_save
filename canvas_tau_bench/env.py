@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import json
-import mimetypes
 import os
 import re
+import subprocess
+import sys
 import uuid
 from typing import Any, Dict, List, Optional, Type
 
 from bs4 import BeautifulSoup, NavigableString
-from playwright.sync_api import Browser, Playwright, sync_playwright
 
 from .tools import ALL_TOOLS, Tool, canvas_snapshot, init_canvas_data
 from .types import (
@@ -45,7 +44,7 @@ The provided image may be schematic or illustrative. Do not rely solely on visua
 - Multi-turn behavior is required.
 - In each non-final turn, do exactly one small reasoning step.
 - Non-final turns must contain exactly one `<think>...</think>`.
-- If you need to edit the notebook this turn, include exactly one `<tool_call>...</tool_call>`.
+- Every non-final turn must include exactly one `<tool_call>...</tool_call>`.
 - Tool call payload must be strict JSON with:
   {"name":"tool_name","arguments":{...}}
   You may also use {"name":"tool_name","args":{...}}.
@@ -61,7 +60,7 @@ Step 1: Think one step
 - Use critic feedback and render state to correct errors.
 
 Step 2: Tool call
-- Immediately after `<think>`, if needed, output one `<tool_call>`.
+- Immediately after `<think>`, output exactly one `<tool_call>`.
 - Prefer incremental edits that directly reduce mismatch.
 - Wait for tool response and critic feedback before next step.
 
@@ -108,6 +107,10 @@ FINAL_ANSWER_ONLY_RE = re.compile(
 )
 VERDICT_CORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*CORRECT\s*$", re.IGNORECASE | re.MULTILINE)
 VERDICT_INCORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*INCORRECT\s*$", re.IGNORECASE | re.MULTILINE)
+ANSWER_TAG_PRESENT_RE = re.compile(r"<answer>", re.IGNORECASE)
+ANSWER_LENIENT_RE = re.compile(r"<answer>(.*?)</(?:answer|endanswer)>", re.IGNORECASE | re.DOTALL)
+TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.IGNORECASE | re.DOTALL)
+TOOL_LEGACY_BLOCK_RE = re.compile(r"<tool>.*?</tool>", re.IGNORECASE | re.DOTALL)
 
 
 class CanvasCRUDEnv:
@@ -117,6 +120,9 @@ class CanvasCRUDEnv:
         user_strategy: str = "scripted",
         user_model: str = "gpt-4o-mini",
         user_provider: str = "openai",
+        user_api_base_url: Optional[str] = None,
+        user_api_key: Optional[str] = None,
+        user_max_tokens: Optional[int] = None,
     ) -> None:
         self.tasks = tasks
         self.task_index = 0
@@ -127,7 +133,14 @@ class CanvasCRUDEnv:
         self.tools_info = [t.get_info() for t in ALL_TOOLS]
         self.wiki = CANVAS_WIKI
         self.terminate_tools = {"finish_canvas"}
-        self.critic = load_user(user_strategy, model=user_model, provider=user_provider)
+        self.critic = load_user(
+            user_strategy,
+            model=user_model,
+            provider=user_provider,
+            api_base_url=user_api_base_url,
+            api_key=user_api_key,
+            max_tokens=user_max_tokens,
+        )
 
         self.data = init_canvas_data()
         self.target_canvas: Dict[str, Any] = {}
@@ -141,8 +154,7 @@ class CanvasCRUDEnv:
         self.actions: List[Action] = []
         self.assistant_messages: List[str] = []
         self.answer_history: List[str] = []
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
+        self.last_critic_usage: Dict[str, int] = {}
 
     def reset(self, task_index: Optional[int] = None) -> EnvResetResponse:
         if task_index is not None:
@@ -152,6 +164,7 @@ class CanvasCRUDEnv:
         self.actions = []
         self.assistant_messages = []
         self.answer_history = []
+        self.last_critic_usage = {}
         self.turn_id = 0
         self.target_canvas = {}
         self.target_image_path = ""
@@ -175,7 +188,7 @@ class CanvasCRUDEnv:
             resolved_path = self._resolve_image_path(task_target_path)
             if resolved_path:
                 self.target_image_path = resolved_path
-                self.target_image_url = self._image_path_to_data_url(resolved_path)
+                self.target_image_url = ""
         elif self.target_canvas:
             self.target_image_path, self.target_image_url = self._render_snapshot(
                 snapshot=self.target_canvas,
@@ -191,7 +204,7 @@ class CanvasCRUDEnv:
         critic_opening = self.critic.reset(
             instruction=self.task.instruction,
             target_canvas=self.target_canvas,
-            target_image_url=self.target_image_url,
+            target_image_url=self.target_image_url or self.target_image_path,
         )
         init_payload = {
             "type": "init_bundle",
@@ -217,22 +230,6 @@ class CanvasCRUDEnv:
         if os.path.exists(joined):
             return joined
         return ""
-
-    def _image_path_to_data_url(self, path: str) -> str:
-        mime, _ = mimetypes.guess_type(path)
-        if not mime:
-            ext = os.path.splitext(path)[1].lower()
-            if ext == ".svg":
-                mime = "image/svg+xml"
-            elif ext in {".jpg", ".jpeg"}:
-                mime = "image/jpeg"
-            elif ext == ".webp":
-                mime = "image/webp"
-            else:
-                mime = "image/png"
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("utf-8")
-        return f"data:{mime};base64,{encoded}"
 
     def _looks_like_canvas_state(self, data: Dict[str, Any]) -> bool:
         return all(k in data for k in ("id", "tag", "children"))
@@ -289,29 +286,6 @@ class CanvasCRUDEnv:
         if VERDICT_INCORRECT_RE.search(content):
             return False
         return None
-
-    def _ensure_browser(self) -> None:
-        if self._playwright is None:
-            self._playwright = sync_playwright().start()
-        if self._browser is None:
-            self._browser = self._playwright.chromium.launch(headless=True)
-
-    def _close_browser(self) -> None:
-        if self._browser is not None:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright is not None:
-            try:
-                self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
-
-    def __del__(self) -> None:
-        self._close_browser()
 
     def _html_shell(self, title: str, body_html: str) -> str:
         safe_title = html.escape(title)
@@ -435,22 +409,27 @@ class CanvasCRUDEnv:
         return str(tag)
 
     def _render_html_to_png(self, html_text: str, output_path: str) -> None:
-        self._ensure_browser()
-        assert self._browser is not None
-        page = self._browser.new_page(
-            viewport={"width": 1200, "height": 900},
-            device_scale_factor=2,
-        )
-        try:
-            page.set_content(html_text, wait_until="load")
-            page.screenshot(path=output_path, full_page=True)
-        finally:
-            page.close()
+        html_path = f"{output_path}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_text)
 
-    def _file_to_data_url(self, path: str, mime: str = "image/png") -> str:
-        with open(path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("utf-8")
-        return f"data:{mime};base64,{encoded}"
+        worker_path = os.path.join(os.path.dirname(__file__), "render_worker.py")
+        cmd = [
+            sys.executable,
+            worker_path,
+            "--html-path",
+            html_path,
+            "--output-path",
+            output_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            os.remove(html_path)
+        except OSError:
+            pass
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"Render worker failed: {err}")
 
     def _render_snapshot(
         self,
@@ -473,7 +452,9 @@ class CanvasCRUDEnv:
 
         html_text = self._html_shell(title=title, body_html=body_html)
         self._render_html_to_png(html_text, path)
-        return path, self._file_to_data_url(path, mime="image/png")
+        # Keep observation payload short: pass local image path in trajectory,
+        # and convert to data URL only right before model call.
+        return path, ""
 
     def step(
         self,
@@ -487,8 +468,40 @@ class CanvasCRUDEnv:
         reward = 0.0
         info = EnvInfo(task=self.task)
         action_done = False
+        raw_message = str(assistant_message or "")
+        parsed = parsed_assistant or {}
+        answer_text = str(parsed.get("answer", "")).strip()
+        has_answer = bool(answer_text)  # strict valid answer tag path: <answer>...</answer>
+        has_answer_tag = bool(ANSWER_TAG_PRESENT_RE.search(raw_message))
+        is_answer_attempt = bool(has_answer or has_answer_tag)
 
-        if action.name == RESPOND_ACTION_NAME:
+        tool_blocks = TOOL_CALL_BLOCK_RE.findall(raw_message) + TOOL_LEGACY_BLOCK_RE.findall(raw_message)
+        tool_block_count = len(tool_blocks)
+        parsed_tool = parsed.get("tool")
+        has_valid_parsed_tool = bool(
+            isinstance(parsed_tool, dict) and str(parsed_tool.get("name", "")).strip()
+        )
+        policy_format_error = ""
+        if not is_answer_attempt:
+            if tool_block_count == 0:
+                policy_format_error = (
+                    "Non-final turn is missing <tool_call>. "
+                    "Output exactly one CRUD <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>."
+                )
+            elif tool_block_count > 1:
+                policy_format_error = (
+                    "Non-final turn has multiple tool blocks. "
+                    "Output exactly one <tool_call> block."
+                )
+            elif not has_valid_parsed_tool:
+                policy_format_error = (
+                    "Malformed <tool_call> payload. Use strict JSON with "
+                    "{\"name\":\"tool_name\",\"arguments\":{...}}."
+                )
+
+        if policy_format_error:
+            tool_obs = f"Error: {policy_format_error}"
+        elif action.name == RESPOND_ACTION_NAME:
             tool_obs = "No tool executed in this turn."
         elif action.name in self.tools_map:
             try:
@@ -509,8 +522,10 @@ class CanvasCRUDEnv:
         )
         current_hash = self._data_hash(self.data)
         matches_target: Optional[bool] = (current_hash == self.gt_hash) if self.gt_hash else None
-        answer_text = str((parsed_assistant or {}).get("answer", "")).strip()
-        has_answer = bool(answer_text)
+        lenient_match = ANSWER_LENIENT_RE.search(raw_message)
+        lenient_answer_text = lenient_match.group(1).strip() if lenient_match else ""
+        has_malformed_answer = bool(has_answer_tag and not has_answer)
+        answer_candidate_for_feedback = bool(has_answer or has_malformed_answer)
         answer_eval: Dict[str, Any]
         if has_answer:
             self.answer_history.append(answer_text)
@@ -518,6 +533,17 @@ class CanvasCRUDEnv:
                 answer_text=answer_text,
                 full_message=assistant_message,
             )
+        elif has_malformed_answer:
+            boxed_match = BOXED_RE.fullmatch(lenient_answer_text.strip()) if lenient_answer_text else None
+            answer_eval = {
+                "has_answer": True,
+                "answer_text": lenient_answer_text,
+                "boxed_format_ok": bool(boxed_match),
+                "boxed_value": boxed_match.group("inner").strip() if boxed_match else "",
+                "answer_only_ok": False,
+                "format_ok": False,
+                "reason": "Malformed final answer tag. Use exact <answer>...</answer>.",
+            }
         else:
             answer_eval = {
                 "has_answer": False,
@@ -542,6 +568,7 @@ class CanvasCRUDEnv:
             "matches_target": matches_target,
             "action_terminated": action_done,
             "answer_evaluation": answer_eval,
+            "policy_format_error": policy_format_error,
         }
         if has_answer:
             critic_context["answer_check"] = {
@@ -556,11 +583,11 @@ class CanvasCRUDEnv:
                 ],
             }
 
-        if has_answer and not answer_eval.get("format_ok", False):
+        if answer_candidate_for_feedback and not answer_eval.get("format_ok", False):
             critic_context["answer_error_notice"] = (
                 "Answer format is invalid. Final turn must be exactly <answer>\\boxed{...}</answer>."
             )
-        if has_answer:
+        if answer_candidate_for_feedback:
             critic_context["critic_output_format"] = (
                 "If evaluating an answer, respond with:\n"
                 "VERDICT: CORRECT or VERDICT: INCORRECT\n"
@@ -569,7 +596,10 @@ class CanvasCRUDEnv:
             )
 
         critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
+        self.last_critic_usage = dict(self.critic.get_last_usage() or {})
         info.source = "critic"
+        # Always expose critic cumulative cost, even for non-terminal/failed runs.
+        info.user_cost = self.critic.get_total_cost()
 
         # Canvas-style assistant feedback bundle: include render result and critique.
         assistant_feedback_payload = {
@@ -593,10 +623,5 @@ class CanvasCRUDEnv:
         if done:
             reward, reward_info = self.calculate_reward(critic_correct=True)
             info.reward_info = reward_info
-            info.user_cost = self.critic.get_total_cost()
-        elif has_answer and critic_verdict is False:
-            info.user_cost = self.critic.get_total_cost()
-        elif has_answer and critic_verdict is None:
-            info.user_cost = self.critic.get_total_cost()
 
         return EnvResponse(observation=obs, reward=reward, done=done, info=info)
