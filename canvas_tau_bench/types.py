@@ -58,14 +58,12 @@ class RewardInfo:
 class EnvInfo:
     task: Task
     source: Optional[str] = None
-    user_cost: Optional[float] = None
     reward_info: Optional[RewardInfo] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "task": self.task.to_dict(),
             "source": self.source,
-            "user_cost": self.user_cost,
             "reward_info": None if self.reward_info is None else self.reward_info.to_dict(),
         }
 
@@ -89,7 +87,6 @@ class SolveResult:
     reward: float
     messages: List[Dict[str, Any]]
     info: Dict[str, Any]
-    total_cost: float = 0.0
 
 
 @dataclass

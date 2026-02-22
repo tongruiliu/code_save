@@ -346,7 +346,6 @@ class ToolCallingAgent:
         trajectory_messages.extend(init_obs_messages)
 
         reward = 0.0
-        total_cost = 0.0
         turns: List[Dict[str, Any]] = []
         image_data_cache: Dict[str, str] = {}
 
@@ -368,8 +367,6 @@ class ToolCallingAgent:
                 **completion_kwargs,
             )
             next_message = res.choices[0].message.model_dump()
-            assistant_cost = float(res._hidden_params.get("response_cost") or 0.0)
-            total_cost += assistant_cost
             assistant_usage = _usage_to_dict(getattr(res, "usage", None))
 
             action, parsed = message_to_action(next_message)
@@ -394,7 +391,6 @@ class ToolCallingAgent:
                     "assistant_tool": parsed.get("tool"),
                     "assistant_answer": parsed.get("answer", ""),
                     "assistant_usage": assistant_usage,
-                    "assistant_cost": assistant_cost,
                     "critic_usage": critic_usage,
                     "action": action.to_dict(),
                     "critic_feedback": critic_feedback_compact,
@@ -425,5 +421,4 @@ class ToolCallingAgent:
                 "assistant_usage_total": _sum_usage([t.get("assistant_usage", {}) for t in turns]),
                 "critic_usage_total": _sum_usage([t.get("critic_usage", {}) for t in turns]),
             },
-            total_cost=total_cost,
         )

@@ -202,26 +202,6 @@ def display_metrics(results: List[EnvRunResult]) -> None:
         print(f"  k={k}: {total / len(c_per_task_id):.4f}")
 
 
-def display_costs(results: List[EnvRunResult]) -> None:
-    model_cost_sum = 0.0
-    critic_cost_sum = 0.0
-    total_cost_sum = 0.0
-
-    for r in results:
-        info = r.info if isinstance(r.info, dict) else {}
-        model_cost = float(info.get("model_cost") or 0.0)
-        critic_cost = float(info.get("user_cost") or 0.0)
-        total_cost = float(info.get("total_cost") or (model_cost + critic_cost))
-        model_cost_sum += model_cost
-        critic_cost_sum += critic_cost
-        total_cost_sum += total_cost
-
-    print("Cost (USD)")
-    print(f"  policy_model: {model_cost_sum:.6f}")
-    print(f"  critic_model: {critic_cost_sum:.6f}")
-    print(f"  total: {total_cost_sum:.6f}")
-
-
 def build_sft_records(result: EnvRunResult) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     turns = result.info.get("turns", []) if isinstance(result.info, dict) else []
@@ -378,11 +358,6 @@ def main() -> None:
             try:
                 solve_res = agent.solve(env=env, task_index=idx, max_num_steps=args.max_steps)
                 info = dict(solve_res.info or {})
-                model_cost = float(getattr(solve_res, "total_cost", 0.0) or 0.0)
-                user_cost = float(info.get("user_cost") or 0.0)
-                info["model_cost"] = model_cost
-                info["user_cost"] = user_cost
-                info["total_cost"] = model_cost + user_cost
                 result = EnvRunResult(
                     task_id=idx,
                     reward=solve_res.reward,
@@ -397,9 +372,10 @@ def main() -> None:
                     info={
                         "error": str(exc),
                         "traceback": traceback.format_exc(),
-                        "model_cost": 0.0,
-                        "user_cost": 0.0,
-                        "total_cost": 0.0,
+                        "policy_model": args.model,
+                        "critic_model": args.user_model,
+                        "policy_api_base_url": args.api_base_url,
+                        "critic_api_base_url": args.user_api_base_url or args.api_base_url,
                     },
                     traj=[],
                     trial=trial,
@@ -409,7 +385,6 @@ def main() -> None:
             results.append(result)
 
     display_metrics(results)
-    display_costs(results)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump([r.to_dict() for r in results], f, ensure_ascii=False, indent=2)

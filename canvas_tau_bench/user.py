@@ -108,10 +108,6 @@ class BaseUserSimulation(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def get_total_cost(self) -> float:
-        raise NotImplementedError
-
-    @abc.abstractmethod
     def get_last_usage(self) -> Dict[str, int]:
         raise NotImplementedError
 
@@ -141,9 +137,6 @@ class HumanUserSimulation(BaseUserSimulation):
             if context.get("answer_check") is not None:
                 print("Please reply with VERDICT: CORRECT or VERDICT: INCORRECT.")
         return input("critic> ")
-
-    def get_total_cost(self) -> float:
-        return 0.0
 
     def get_last_usage(self) -> Dict[str, int]:
         return {}
@@ -242,7 +235,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
 
         if policy_format_error and not has_answer:
             return (
-                "Policy format violation: non-final turn must contain exactly one valid "
+                "Policy format violation: non-final turn must contain exactly one <think>...</think> and one valid "
                 "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. Retry one CRUD action."
             )
 
@@ -253,15 +246,15 @@ class ScriptedUserSimulation(BaseUserSimulation):
                 return (
                     "VERDICT: INCORRECT\n"
                     "REASON: Final answer format is invalid. It must be answer-only with \\boxed{...}.\n"
-                    "FEEDBACK: Student answer is incorrect. Check hallucination risk and output "
-                    "<answer>\\boxed{final_answer}</answer> only."
+                    "FEEDBACK: Answer is incorrect. Rethink the method and analyze image/workflow errors, then output "
+                    "<answer>\\boxed{final_answer}</answer> only when confident."
                 )
 
             if has_match_signal and not matches_target:
                 return (
                     "VERDICT: INCORRECT\n"
                     "REASON: Rendered canvas does not match target render.\n"
-                    "FEEDBACK: Student answer is incorrect. Check hallucination risk and fix the visual mismatch first."
+                    "FEEDBACK: Answer is incorrect. Rethink the method and analyze why the current render mismatches target, then fix with one tool step."
                 )
 
             if gold_answers:
@@ -270,7 +263,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
                     return (
                         "VERDICT: INCORRECT\n"
                         "REASON: Model answer is not equivalent to the gold answer.\n"
-                        "FEEDBACK: Student answer is incorrect. Check hallucination risk and correct the final answer."
+                        "FEEDBACK: Answer is incorrect. Rethink the method and analyze the error from current render/workflow before next tool step."
                     )
 
             return (
@@ -291,9 +284,6 @@ class ScriptedUserSimulation(BaseUserSimulation):
             return "Still mismatched against target render. Keep editing the canvas."
         return "Continue one precise step. If solved, provide answer-only final output."
 
-    def get_total_cost(self) -> float:
-        return 0.0
-
     def get_last_usage(self) -> Dict[str, int]:
         return {}
 
@@ -312,7 +302,6 @@ class LLMUserSimulation(BaseUserSimulation):
         self.api_base_url = (api_base_url or "").strip()
         self.api_key = (api_key or "").strip()
         self.max_tokens = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
-        self.total_cost = 0.0
         self.last_usage: Dict[str, int] = {}
         self._image_data_cache: Dict[str, str] = {}
         self.instruction: str = ""
@@ -336,6 +325,8 @@ class LLMUserSimulation(BaseUserSimulation):
             "  VERDICT: CORRECT or VERDICT: INCORRECT\n"
             "  REASON: <short audit reason>\n"
             "  FEEDBACK: <single next action or closure>\n"
+            "- If VERDICT is INCORRECT, FEEDBACK must explicitly tell the student to rethink the method "
+            "and analyze why the current rendered image/workflow is wrong before the next tool step.\n"
             "- No markdown list, no JSON, no code block, no extra lines."
         )
 
@@ -391,6 +382,14 @@ class LLMUserSimulation(BaseUserSimulation):
 
         reason = " ".join(reason.split())
         feedback = " ".join(feedback.split())
+        if verdict == "INCORRECT":
+            if not reason:
+                reason = "The final answer is inconsistent with the target constraints."
+            # Keep critic behavior stable: always require rethink + image-based error analysis.
+            feedback = (
+                "Answer is incorrect. Rethink the method and analyze the error using the current rendered image "
+                "before the next tool step."
+            )
         if len(reason) > 140:
             reason = reason[:140].rsplit(" ", 1)[0].strip()
         if len(feedback) > 140:
@@ -458,7 +457,6 @@ class LLMUserSimulation(BaseUserSimulation):
             **completion_kwargs,
         )
         msg = res.choices[0].message
-        self.total_cost += (res._hidden_params.get("response_cost") or 0.0)
         self.last_usage = _usage_to_dict(getattr(res, "usage", None))
         return self._message_content_to_text(msg.content)
 
@@ -490,7 +488,7 @@ class LLMUserSimulation(BaseUserSimulation):
 
         if policy_format_error and not (isinstance(answer_eval, dict) and answer_eval.get("has_answer")):
             return (
-                "Policy format violation: non-final turn must include exactly one valid "
+                "Policy format violation: non-final turn must include exactly one <think>...</think> and one valid "
                 "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. "
                 "Retry with one concrete CRUD action only."
             )
@@ -513,6 +511,10 @@ class LLMUserSimulation(BaseUserSimulation):
         if isinstance(answer_eval, dict) and answer_eval.get("has_answer"):
             text_blocks.append(
                 "Answer evaluation turn: return exactly VERDICT/REASON/FEEDBACK and judge semantic equivalence."
+            )
+            text_blocks.append(
+                "If incorrect, FEEDBACK must explicitly ask the student to rethink the method and "
+                "analyze error causes from the current rendered image/workflow before next tool step."
             )
         if answer_error_notice:
             text_blocks.append(answer_error_notice)
@@ -549,9 +551,6 @@ class LLMUserSimulation(BaseUserSimulation):
         if isinstance(answer_eval, dict) and answer_eval.get("has_answer"):
             return self._sanitize_answer_feedback(raw_output)
         return self._sanitize_non_answer_feedback(raw_output)
-
-    def get_total_cost(self) -> float:
-        return self.total_cost
 
     def get_last_usage(self) -> Dict[str, int]:
         return dict(self.last_usage)

@@ -48,6 +48,7 @@ The provided image may be schematic or illustrative. Do not rely solely on visua
 - Tool call payload must be strict JSON with:
   {"name":"tool_name","arguments":{...}}
   You may also use {"name":"tool_name","args":{...}}.
+- Tool-call JSON must be brace-balanced. Do NOT add extra closing braces like `}}}`.
 - Final turn must be answer-only:
   <answer>\\boxed{final_answer}</answer>
 - In final turn, output nothing outside `<answer>...</answer>`.
@@ -109,6 +110,7 @@ VERDICT_CORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*CORRECT\s*$", re.IGNORECASE 
 VERDICT_INCORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*INCORRECT\s*$", re.IGNORECASE | re.MULTILINE)
 ANSWER_TAG_PRESENT_RE = re.compile(r"<answer>", re.IGNORECASE)
 ANSWER_LENIENT_RE = re.compile(r"<answer>(.*?)</(?:answer|endanswer)>", re.IGNORECASE | re.DOTALL)
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.IGNORECASE | re.DOTALL)
 TOOL_LEGACY_BLOCK_RE = re.compile(r"<tool>.*?</tool>", re.IGNORECASE | re.DOTALL)
 
@@ -475,6 +477,9 @@ class CanvasCRUDEnv:
         has_answer_tag = bool(ANSWER_TAG_PRESENT_RE.search(raw_message))
         is_answer_attempt = bool(has_answer or has_answer_tag)
 
+        think_blocks = THINK_BLOCK_RE.findall(raw_message)
+        think_block_count = len(think_blocks)
+        parsed_think = str(parsed.get("think", "") or "").strip()
         tool_blocks = TOOL_CALL_BLOCK_RE.findall(raw_message) + TOOL_LEGACY_BLOCK_RE.findall(raw_message)
         tool_block_count = len(tool_blocks)
         parsed_tool = parsed.get("tool")
@@ -483,7 +488,22 @@ class CanvasCRUDEnv:
         )
         policy_format_error = ""
         if not is_answer_attempt:
-            if tool_block_count == 0:
+            if think_block_count == 0:
+                policy_format_error = (
+                    "Non-final turn is missing <think>. "
+                    "Output exactly one <think>...</think> before <tool_call>."
+                )
+            elif think_block_count > 1:
+                policy_format_error = (
+                    "Non-final turn has multiple <think> blocks. "
+                    "Output exactly one <think> block."
+                )
+            elif not parsed_think:
+                policy_format_error = (
+                    "Empty <think> block. "
+                    "Provide one concise step in <think> before the tool call."
+                )
+            elif tool_block_count == 0:
                 policy_format_error = (
                     "Non-final turn is missing <tool_call>. "
                     "Output exactly one CRUD <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>."
@@ -494,10 +514,18 @@ class CanvasCRUDEnv:
                     "Output exactly one <tool_call> block."
                 )
             elif not has_valid_parsed_tool:
-                policy_format_error = (
-                    "Malformed <tool_call> payload. Use strict JSON with "
-                    "{\"name\":\"tool_name\",\"arguments\":{...}}."
-                )
+                raw_tool_call = str(parsed.get("raw_tool_call", "") or parsed.get("raw_tool", "") or "")
+                normalized_tool = re.sub(r"\s+", "", raw_tool_call)
+                if "}}}" in normalized_tool:
+                    policy_format_error = (
+                        "Malformed <tool_call> payload: extra closing brace detected. "
+                        "Use brace-balanced JSON, e.g. ...\"arguments\":{...}}</tool_call> (not }}})."
+                    )
+                else:
+                    policy_format_error = (
+                        "Malformed <tool_call> payload. Use strict JSON with "
+                        "{\"name\":\"tool_name\",\"arguments\":{...}}."
+                    )
 
         if policy_format_error:
             tool_obs = f"Error: {policy_format_error}"
@@ -598,8 +626,6 @@ class CanvasCRUDEnv:
         critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
         self.last_critic_usage = dict(self.critic.get_last_usage() or {})
         info.source = "critic"
-        # Always expose critic cumulative cost, even for non-terminal/failed runs.
-        info.user_cost = self.critic.get_total_cost()
 
         # Canvas-style assistant feedback bundle: include render result and critique.
         assistant_feedback_payload = {
