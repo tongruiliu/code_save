@@ -235,8 +235,10 @@ class ScriptedUserSimulation(BaseUserSimulation):
 
         if policy_format_error and not has_answer:
             return (
-                "Policy format violation: non-final turn must contain exactly one <think>...</think> and one valid "
-                "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. Retry one CRUD action."
+                "Format rejected. Re-output this turn exactly as:\n"
+                "<think>one concise reasoning step</think>\n"
+                "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                "No extra text. JSON must be valid and brace-balanced."
             )
 
         if has_answer:
@@ -487,10 +489,14 @@ class LLMUserSimulation(BaseUserSimulation):
         policy_format_error = str(ctx.get("policy_format_error", "") or "").strip()
 
         if policy_format_error and not (isinstance(answer_eval, dict) and answer_eval.get("has_answer")):
+            format_repair_notice = str(ctx.get("format_repair_notice", "") or "").strip()
+            if format_repair_notice:
+                return format_repair_notice
             return (
-                "Policy format violation: non-final turn must include exactly one <think>...</think> and one valid "
-                "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>. "
-                "Retry with one concrete CRUD action only."
+                "Format rejected. Re-output this turn exactly as:\n"
+                "<think>one concise reasoning step</think>\n"
+                "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                "No extra text. JSON must be valid and brace-balanced."
             )
 
         # Hard guard for malformed final-answer format to ensure immediate correction signal.

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Type
 
 from bs4 import BeautifulSoup, NavigableString
 
+from .blackboard_tools import blackboard_tools
 from .tools import ALL_TOOLS, Tool, canvas_snapshot, init_canvas_data
 from .types import (
     Action,
@@ -25,80 +26,58 @@ from .types import (
 from .user import load_user
 
 
-CANVAS_WIKI = """# Objective
-You are a Visual-Reasoning Agent solving problems by synchronizing reasoning with a notebook-like canvas.
-The critic is the user role. Your goal is high-accuracy, stepwise progress.
+CANVAS_WIKI_TEMPLATE = """# Objective #
+You are a **Visual-Reasoning Agent**, solving complex problems by synchronizing a visual Chain-of-Thought on a virtual notebook.
+The primary goal is **100% accuracy**.
 
-# Special Handling for Physics Problems
-If the question involves physics (Mechanics, Kinematics, Dynamics, etc.):
-1. Identify constraints explicitly before calculating.
-2. Verify assumptions from text constraints, not visual guess.
-3. Cross-check results if a conclusion depends mainly on visual intuition.
+# Process #
+# Step 1: Think Only One Step
+- You should think one more step based on the current notebook/image state.
+- Output one concise `<think>...</think>` block.
+- Each turn should contain only a small part of reasoning.
+- Use critic feedback and tool results to fix prior mistakes.
 
-# Critical Instruction: Text over Vision
-The provided image may be schematic or illustrative. Do not rely solely on visual intuition.
-- If text defines a physical constraint, follow text constraints first.
-- Apply physical laws based on text description of constraints and connections.
+# Step 2: Tool Call
+- Immediately after `<think>`, call one notebook tool.
+- Output exactly one `<tool_call>...</tool_call>` block.
+- Use incremental edits; do not jump directly to a final dump.
+- After tool call, wait for tool response and critic feedback.
 
-# Critical Rules
+# Critical Rules #
 - Multi-turn behavior is required.
-- In each non-final turn, do exactly one small reasoning step.
-- Non-final turns must contain exactly one `<think>...</think>`.
-- Every non-final turn must include exactly one `<tool_call>...</tool_call>`.
-- Tool call payload must be strict JSON with:
+- Non-final turns must contain exactly one `<think>` and one `<tool_call>`.
+- Turn 1 is NOT an exception.
+- Tool-call JSON must be valid and brace-balanced.
+- Use strict payload:
   {"name":"tool_name","arguments":{...}}
-  You may also use {"name":"tool_name","args":{...}}.
-- Tool-call JSON must be brace-balanced. Do NOT add extra closing braces like `}}}`.
+  ({"name":"tool_name","args":{...}} is also accepted.)
 - Final turn must be answer-only:
   <answer>\\boxed{final_answer}</answer>
 - In final turn, output nothing outside `<answer>...</answer>`.
-- Do not output final answer until you are confident the task is solved.
 
-# Process
-Step 1: Think one step
-- Output one concise `<think>` for this step only.
-- Do not dump long reasoning at once.
-- Use critic feedback and render state to correct errors.
-
-Step 2: Tool call
-- Immediately after `<think>`, output exactly one `<tool_call>`.
-- Prefer incremental edits that directly reduce mismatch.
-- Wait for tool response and critic feedback before next step.
-
-# Notebook Operation Restrictions
-- The notebook area has fixed width; keep structure clean and non-overlapping.
-- All SVG elements should remain in a single SVG canvas.
-- Keep updates incremental and structured.
-- Avoid overlapping or contradictory edits.
+# Notebook Operation Restrictions #
+- Keep structure clean, incremental, and non-overlapping.
+- Keep IDs stable; new elements must have unique ids.
 - Prefer minimal edits over rewriting large blocks.
-- Keep IDs stable; when creating elements, assign clear unique IDs.
-- Avoid unnecessary style noise (heavy backgrounds, redundant borders/shadows).
-- Keep readable typography and spacing.
 
-# Available Tools
-- insert_element
-- modify_element
-- remove_element
-- replace_element
-- clear
-- finish_canvas
+# Notebook & Tools #
+The notebook is an HTML container (**Width: 800px**, Height: Auto). You have the following tools.
+<tools>
+{provided_tools}
+</tools>
 
-# Tool Call Format
+For each function call, return a JSON object with function name and arguments in `<tool_call></tool_call>`:
 <tool_call>
 {"name":"insert_element","arguments":{"fragment":"<div id='x'>...</div>","rootId":"root"}}
 </tool_call>
 
-# Output Templates
-1) Edit turn
-<think>short reasoning for one step</think>
+# Output Templates #
+1) Non-final turn
+<think>one concise reasoning step</think>
 <tool_call>{"name":"modify_element","arguments":{"targetId":"x","attrs":{"text":"..."}}}</tool_call>
 
 2) Final turn
 <answer>\\boxed{done}</answer>
-
-# Failure handling
-- If critic flags hallucination risk or wrong answer, locate the concrete mismatch first.
-- Do not repeat the same failing tool arguments; fix them explicitly.
 """
 
 BOXED_RE = re.compile(r"^(?:\\boxed|/boxed)\{(?P<inner>.*)\}$", re.DOTALL)
@@ -132,8 +111,12 @@ class CanvasCRUDEnv:
         self.tools_map: Dict[str, Type[Tool]] = {
             t.get_info()["function"]["name"]: t for t in ALL_TOOLS
         }
-        self.tools_info = [t.get_info() for t in ALL_TOOLS]
-        self.wiki = CANVAS_WIKI
+        self.tools_info = json.loads(json.dumps(blackboard_tools))
+        finish_tool = self.tools_map.get("finish_canvas")
+        if finish_tool is not None:
+            self.tools_info.append(finish_tool.get_info())
+        provided_tools = json.dumps(self.tools_info, ensure_ascii=False, indent=2)
+        self.wiki = CANVAS_WIKI_TEMPLATE.replace("{provided_tools}", provided_tools)
         self.terminate_tools = {"finish_canvas"}
         self.critic = load_user(
             user_strategy,
@@ -527,6 +510,14 @@ class CanvasCRUDEnv:
                         "{\"name\":\"tool_name\",\"arguments\":{...}}."
                     )
 
+        format_repair_notice = (
+            "Format rejected. Re-output this turn with EXACT structure:\n"
+            "<think>one concise reasoning step</think>\n"
+            "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+            "Rules: include exactly one <think> and one <tool_call>; no extra text; "
+            "JSON must be valid and brace-balanced (no extra '}' )."
+        )
+
         if policy_format_error:
             tool_obs = f"Error: {policy_format_error}"
         elif action.name == RESPOND_ACTION_NAME:
@@ -597,6 +588,7 @@ class CanvasCRUDEnv:
             "action_terminated": action_done,
             "answer_evaluation": answer_eval,
             "policy_format_error": policy_format_error,
+            "format_repair_notice": format_repair_notice if policy_format_error else "",
         }
         if has_answer:
             critic_context["answer_check"] = {
@@ -623,8 +615,12 @@ class CanvasCRUDEnv:
                 "FEEDBACK: <next-step feedback or closure>"
             )
 
-        critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
-        self.last_critic_usage = dict(self.critic.get_last_usage() or {})
+        if policy_format_error and not answer_candidate_for_feedback:
+            critic_feedback = format_repair_notice
+            self.last_critic_usage = {}
+        else:
+            critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
+            self.last_critic_usage = dict(self.critic.get_last_usage() or {})
         info.source = "critic"
 
         # Canvas-style assistant feedback bundle: include render result and critique.

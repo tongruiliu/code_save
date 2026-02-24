@@ -12,6 +12,7 @@ A standalone minimal implementation independent of `tau-bench`:
 - `agent.py`: Policy agent that parses `<think>/<tool_call>/<answer>` from assistant outputs.
 - `env.py`: Canvas CRUD environment, critic feedback loop, and reward logic.
 - `tools.py`: Canvas CRUD tool definitions and execution.
+- `blackboard_tools.py`: Canvas-style tool schema registry (prompt/API tool registration).
 - `user.py`: Critic simulator with `scripted / human / llm` strategies.
 - `types.py`: Data structure definitions.
 
@@ -19,6 +20,7 @@ A standalone minimal implementation independent of `tau-bench`:
 
 - `assistant`: The policy model being distilled.
 - `user`: The critic providing turn-level feedback.
+- Tool schemas are injected as Canvas-style registry (`<tools>...</tools>`) and also passed via API `tools/tool_choice=auto`.
 - The assistant is expected to output:
   - Non-final turns should include `<think>...</think>` and advance only one step
   - `<tool_call>{"name":"...","arguments":{...}}</tool_call>` when executing one CRUD action for that step

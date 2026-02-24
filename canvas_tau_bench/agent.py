@@ -26,6 +26,8 @@ CRITIQUE_PROMPT = "<tool_response><image>This is the state of notebook. Critical
 
 
 def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     if isinstance(content, dict):
@@ -197,6 +199,12 @@ def _observation_to_user_messages(observation: str) -> List[Dict[str, Any]]:
         text_lines: List[str] = []
         if instruction:
             text_lines.append(f"Task: {instruction}")
+        text_lines.append(
+            "Mandatory format for non-final turns (including turn 1): "
+            "<think>one concise reasoning step</think> followed immediately by "
+            "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>. "
+            "Do not output <tool_call> alone."
+        )
         if critic_feedback:
             text_lines.append(critic_feedback)
         text_block = "\n".join(text_lines).strip() or observation
@@ -282,6 +290,42 @@ def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[st
     return Action(name=parsed["name"], kwargs=parsed["args"]), parsed
 
 
+def _parse_registered_tool_call(message: Dict[str, Any]) -> Tuple[Optional[Action], Optional[Dict[str, Any]], str]:
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None, None, ""
+
+    first = tool_calls[0]
+    if not isinstance(first, dict):
+        return None, None, ""
+
+    fn_obj = first.get("function")
+    if isinstance(fn_obj, dict):
+        name = fn_obj.get("name")
+        raw_args = fn_obj.get("arguments")
+    else:
+        name = first.get("name")
+        raw_args = first.get("arguments")
+
+    if not isinstance(name, str) or not name.strip():
+        return None, None, ""
+
+    args: Dict[str, Any] = {}
+    if isinstance(raw_args, dict):
+        args = raw_args
+    elif isinstance(raw_args, str):
+        try:
+            decoded = json.loads(raw_args)
+            if isinstance(decoded, dict):
+                args = decoded
+        except json.JSONDecodeError:
+            args = {}
+
+    parsed_tool = {"name": name.strip(), "args": args}
+    raw_tool_call = json.dumps({"name": parsed_tool["name"], "arguments": args}, ensure_ascii=False)
+    return Action(name=parsed_tool["name"], kwargs=args), parsed_tool, raw_tool_call
+
+
 def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
     content = _message_content_to_text(message.get("content")).strip()
     think = _extract_first_tag(content, THINK_RE)
@@ -291,6 +335,16 @@ def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
     answer = _extract_first_tag(content, ANSWER_RE)
 
     action, tool_obj = _parse_tool_block(raw_tool)
+    registered_raw_tool_call = ""
+    if action is None:
+        reg_action, reg_tool_obj, reg_raw_tool = _parse_registered_tool_call(message)
+        if reg_action is not None:
+            action = reg_action
+            tool_obj = reg_tool_obj
+            registered_raw_tool_call = reg_raw_tool
+            if not raw_tool_call:
+                raw_tool_call = reg_raw_tool
+
     if action is None:
         respond_text = answer if answer else content
         action = Action(name=RESPOND_ACTION_NAME, kwargs={RESPOND_ACTION_FIELD_NAME: respond_text})
@@ -301,6 +355,7 @@ def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
         "answer": answer,
         "raw_tool_call": raw_tool_call,
         "raw_tool": raw_tool,
+        "registered_raw_tool_call": registered_raw_tool_call,
     }
     return action, parsed
 
@@ -310,6 +365,27 @@ def strip_think_for_history(text: str) -> str:
     if "</think>" in text:
         return text.split("</think>")[-1].strip()
     return re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+
+
+def _validate_nonfinal_format(parsed: Dict[str, Any]) -> Optional[str]:
+    # Final answer turn is validated by env/critic; non-final turns must be think+tool_call.
+    if str(parsed.get("answer", "") or "").strip():
+        return None
+    think = str(parsed.get("think", "") or "").strip()
+    if not think:
+        return "Missing or empty <think> block."
+
+    raw_tool = str(parsed.get("raw_tool_call", "") or parsed.get("raw_tool", "") or "").strip()
+    if not raw_tool:
+        return "Missing <tool_call> block."
+    normalized_tool = re.sub(r"\s+", "", raw_tool)
+    if "}}}" in normalized_tool:
+        return "Malformed <tool_call> JSON: extra closing brace '}}}'."
+
+    tool_obj = parsed.get("tool")
+    if not isinstance(tool_obj, dict) or not str(tool_obj.get("name", "")).strip():
+        return "Malformed <tool_call> payload. Use strict JSON with name + arguments."
+    return None
 
 
 class ToolCallingAgent:
@@ -323,6 +399,7 @@ class ToolCallingAgent:
         api_base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         max_tokens: Optional[int] = None,
+        max_format_retries: int = 3,
     ) -> None:
         self.tools_info = tools_info
         self.wiki = wiki
@@ -332,6 +409,7 @@ class ToolCallingAgent:
         self.api_base_url = (api_base_url or "").strip()
         self.api_key = (api_key or "").strip()
         self.max_tokens = max_tokens if isinstance(max_tokens, int) and max_tokens > 0 else None
+        self.max_format_retries = max(1, int(max_format_retries))
 
     def solve(self, env: Any, task_index: Optional[int] = None, max_num_steps: int = 30) -> SolveResult:
         reset_res = env.reset(task_index=task_index)
@@ -358,20 +436,67 @@ class ToolCallingAgent:
             if self.max_tokens is not None:
                 completion_kwargs["max_tokens"] = self.max_tokens
 
-            model_messages = _materialize_messages_for_model(context_messages, image_data_cache)
-            res = completion(
-                model=self.model,
-                custom_llm_provider=self.provider,
-                messages=model_messages,
-                temperature=self.temperature,
-                **completion_kwargs,
-            )
-            next_message = res.choices[0].message.model_dump()
-            assistant_usage = _usage_to_dict(getattr(res, "usage", None))
+            format_retry_msgs: List[Dict[str, Any]] = []
+            assistant_usage: Dict[str, int] = {}
+            parsed: Dict[str, Any] = {}
+            action: Action = Action(name=RESPOND_ACTION_NAME, kwargs={RESPOND_ACTION_FIELD_NAME: ""})
+            assistant_raw = ""
+            assistant_visible = ""
+            latest_format_error: Optional[str] = None
 
-            action, parsed = message_to_action(next_message)
-            assistant_raw = _message_content_to_text(next_message.get("content") or "")
-            assistant_visible = strip_think_for_history(assistant_raw)
+            for attempt in range(self.max_format_retries):
+                attempt_messages = context_messages + format_retry_msgs
+                model_messages = _materialize_messages_for_model(attempt_messages, image_data_cache)
+                res = completion(
+                    model=self.model,
+                    custom_llm_provider=self.provider,
+                    messages=model_messages,
+                    tools=self.tools_info,
+                    tool_choice="auto",
+                    temperature=self.temperature,
+                    **completion_kwargs,
+                )
+                next_message = res.choices[0].message.model_dump()
+                assistant_usage = _usage_to_dict(getattr(res, "usage", None))
+
+                action, parsed = message_to_action(next_message)
+                assistant_raw = _message_content_to_text(next_message.get("content") or "")
+                if parsed.get("registered_raw_tool_call") and not (TOOL_CALL_RE.search(assistant_raw) or TOOL_RE.search(assistant_raw)):
+                    reg_tool = str(parsed.get("registered_raw_tool_call", "")).strip()
+                    if reg_tool:
+                        think_text = str(parsed.get("think", "")).strip()
+                        if think_text:
+                            assistant_raw = f"<think>{think_text}</think>\n<tool_call>{reg_tool}</tool_call>"
+                        else:
+                            assistant_raw = f"<tool_call>{reg_tool}</tool_call>"
+                assistant_visible = strip_think_for_history(assistant_raw)
+
+                latest_format_error = _validate_nonfinal_format(parsed)
+                if latest_format_error is None:
+                    break
+
+                if attempt < self.max_format_retries - 1:
+                    repair_text = (
+                        "Format rejected for this turn. Re-output exactly:\n"
+                        "<think>one concise reasoning step</think>\n"
+                        "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                        "Rules: include exactly one <think> and one <tool_call>; no extra text; "
+                        "JSON must be valid and brace-balanced.\n"
+                        f"Current error: {latest_format_error}"
+                    )
+                    format_retry_msgs.append(_user_message([{"type": "text", "text": repair_text}]))
+
+            if latest_format_error is not None:
+                info = {
+                    **info,
+                    "format_failure": latest_format_error,
+                    "format_retry_count": self.max_format_retries,
+                }
+                break
+
+            if format_retry_msgs:
+                context_messages.extend(format_retry_msgs)
+                trajectory_messages.extend(format_retry_msgs)
 
             env_res = env.step(
                 action=action,

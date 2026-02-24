@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+
+# Keep the 5 core tool schemas aligned with Canvas-CoT/CanvasModule/blackboard_tools.py.
+blackboard_tools: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "insert_element",
+            "description": "Insert a new SVG or HTML element into the blackboard. Used for initial construction or adding new objects.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fragment": {
+                        "type": "string",
+                        "description": "(1) The HTML string to insert. (2) An `svg` tag must be placed within a tag containing `xmlns=\\\"http://www.w3.org/2000/svg\\\"`. (3) Must include an id attribute inside the tag.",
+                    },
+                    "rootId": {
+                        "type": "string",
+                        "description": "The ID of the parent container to append to. Defaults to root if omitted.",
+                    },
+                    "beforeId": {
+                        "type": ["string", "null"],
+                        "description": "The ID of an existing sibling element to insert this new element before. If null, appends to the end.",
+                    },
+                },
+                "required": ["fragment", "rootId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "modify_element",
+            "description": "Update specific attributes of an existing element. Use this for movement, color changes, or state updates without redrawing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targetId": {
+                        "type": "string",
+                        "description": "The id of the element to modify.",
+                    },
+                    "attrs": {
+                        "type": "object",
+                        "description": "Key-value pairs of attributes to update. E.g., {'cx': '100', 'fill': '#ED2633', 'text': 'New Value'}.",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["targetId", "attrs"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_element",
+            "description": "Remove an element from the blackboard.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targetId": {
+                        "type": "string",
+                        "description": "The id of the element to remove.",
+                    }
+                },
+                "required": ["targetId"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_element",
+            "description": "Completely replace an existing element with a new code fragment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targetId": {
+                        "type": "string",
+                        "description": "The id of the old element to be replaced.",
+                    },
+                    "fragment": {
+                        "type": "string",
+                        "description": "The new HTML/SVG string.",
+                    },
+                },
+                "required": ["targetId", "fragment"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear",
+            "description": "Clear all elements. Use only for full resets.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
