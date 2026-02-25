@@ -158,8 +158,8 @@ class ScriptedUserSimulation(BaseUserSimulation):
         return (
             "You are evaluated by a critic in a visual reasoning loop. "
             f"Task: {self.instruction} "
-            "For non-final turns: provide <think>...</think> and exactly one <tool_call>...</tool_call>. "
-            "For final turn: output only <answer>\\boxed{final_answer}</answer> with no extra text."
+            "For non-final turns: provide <think>...</think> and at least one <tool_call>...</tool_call> (one or more). "
+            "For final turn: include <answer>\\boxed{final_answer}</answer>. Tool calls are optional."
         )
 
     def _normalize_token(self, text: str) -> str:
@@ -238,6 +238,7 @@ class ScriptedUserSimulation(BaseUserSimulation):
                 "Format rejected. Re-output this turn exactly as:\n"
                 "<think>one concise reasoning step</think>\n"
                 "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                "[Optional additional <tool_call>...</tool_call> blocks in same turn]\n"
                 "No extra text. JSON must be valid and brace-balanced."
             )
 
@@ -247,9 +248,9 @@ class ScriptedUserSimulation(BaseUserSimulation):
             if not answer_format_ok:
                 return (
                     "VERDICT: INCORRECT\n"
-                    "REASON: Final answer format is invalid. It must be answer-only with \\boxed{...}.\n"
+                    "REASON: Final answer format is invalid. It must include \\boxed{...} inside <answer>.\n"
                     "FEEDBACK: Answer is incorrect. Rethink the method and analyze image/workflow errors, then output "
-                    "<answer>\\boxed{final_answer}</answer> only when confident."
+                    "<answer>\\boxed{final_answer}</answer> when confident."
                 )
 
             if has_match_signal and not matches_target:
@@ -275,16 +276,16 @@ class ScriptedUserSimulation(BaseUserSimulation):
             )
 
         if has_match_signal and matches_target and not has_answer:
-            return "Canvas now matches target. Provide answer-only final output: <answer>\\boxed{...}</answer>."
+            return "Canvas now matches target. Provide final output including <answer>\\boxed{...}</answer>."
         if tool_result.startswith("Error:"):
             return "The last tool action failed. Fix the arguments and try again with one CRUD action."
         if action_terminated and not has_answer:
-            return "finish_canvas was called but final answer is missing. Provide answer-only final output."
+            return "finish_canvas was called but final answer is missing. Provide final output including <answer>\\boxed{...}</answer>."
         if self.turn <= 2:
             return "Target not matched yet. Continue with one concrete CRUD operation."
         if self.turn <= 4:
             return "Still mismatched against target render. Keep editing the canvas."
-        return "Continue one precise step. If solved, provide answer-only final output."
+        return "Continue one precise step. If solved, provide final output including <answer>\\boxed{...}</answer>."
 
     def get_last_usage(self) -> Dict[str, int]:
         return {}
@@ -474,8 +475,8 @@ class LLMUserSimulation(BaseUserSimulation):
         self.last_usage = {}
         self._image_data_cache = {}
         return (
-            "Proceed step by step. Each non-final turn must include one <think> and exactly one <tool_call>. "
-            "Final turn must be answer-only: <answer>\\boxed{final_answer}</answer>."
+            "Proceed step by step. Each non-final turn must include one <think> and at least one <tool_call> (one or more). "
+            "Final turn must include: <answer>\\boxed{final_answer}</answer>. Tool calls are optional."
         )
 
     def step(self, assistant_message: str, context: Optional[Dict[str, Any]] = None) -> str:
@@ -496,6 +497,7 @@ class LLMUserSimulation(BaseUserSimulation):
                 "Format rejected. Re-output this turn exactly as:\n"
                 "<think>one concise reasoning step</think>\n"
                 "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                "[Optional additional <tool_call>...</tool_call> blocks in same turn]\n"
                 "No extra text. JSON must be valid and brace-balanced."
             )
 

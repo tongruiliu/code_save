@@ -23,10 +23,9 @@ A standalone minimal implementation independent of `tau-bench`:
 - Tool schemas are injected as Canvas-style registry (`<tools>...</tools>`); tool execution follows `<tool_call>...</tool_call>` text protocol.
 - The assistant is expected to output:
   - Non-final turns should include `<think>...</think>` and advance only one step
-  - `<tool_call>{"name":"...","arguments":{...}}</tool_call>` when executing one CRUD action for that step
-  - Final answer only as `<answer>\boxed{final_answer}</answer>` (also accepts `/boxed{...}` for compatibility)
-  - Do not include extra text inside `<answer>` beyond the boxed payload
-  - Do not include extra text outside `<answer>` in the final turn
+  - Non-final turns must include one or more `<tool_call>{"name":"...","arguments":{...}}</tool_call>`
+  - Final turn must include `<answer>\boxed{final_answer}</answer>` (also accepts `/boxed{...}` for compatibility)
+  - Final turn may optionally include tool calls
 - The environment executes the tool, compares rendered-vs-target state, and sends critic feedback back as `user` content.
 - Each non-terminal round feeds assistant with a `turn_feedback_bundle` that contains:
   - `tool_response`

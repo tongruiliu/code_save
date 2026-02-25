@@ -38,22 +38,22 @@ The primary goal is **100% accuracy**.
 - Use critic feedback and tool results to fix prior mistakes.
 
 # Step 2: Tool Call
-- Immediately after `<think>`, call one notebook tool.
-- Output exactly one `<tool_call>...</tool_call>` block.
+- Immediately after `<think>`, call notebook tool(s).
+- Output one or more `<tool_call>...</tool_call>` blocks.
 - Use incremental edits; do not jump directly to a final dump.
 - After tool call, wait for tool response and critic feedback.
 
 # Critical Rules #
 - Multi-turn behavior is required.
-- Non-final turns must contain exactly one `<think>` and one `<tool_call>`.
+- Non-final turns must contain exactly one `<think>` and at least one `<tool_call>`.
 - Turn 1 is NOT an exception.
 - Tool-call JSON must be valid and brace-balanced.
 - Use strict payload:
   {"name":"tool_name","arguments":{...}}
   ({"name":"tool_name","args":{...}} is also accepted.)
-- Final turn must be answer-only:
+- Final turn must include:
   <answer>\\boxed{final_answer}</answer>
-- In final turn, output nothing outside `<answer>...</answer>`.
+- In final turn, tool calls are optional.
 
 # Notebook Operation Restrictions #
 - Keep structure clean, incremental, and non-overlapping.
@@ -75,16 +75,13 @@ For each function call, return a JSON object with function name and arguments in
 1) Non-final turn
 <think>one concise reasoning step</think>
 <tool_call>{"name":"modify_element","arguments":{"targetId":"x","attrs":{"text":"..."}}}</tool_call>
+[Optional additional <tool_call>...</tool_call> blocks in same turn]
 
 2) Final turn
 <answer>\\boxed{done}</answer>
 """
 
 BOXED_RE = re.compile(r"^(?:\\boxed|/boxed)\{(?P<inner>.*)\}$", re.DOTALL)
-FINAL_ANSWER_ONLY_RE = re.compile(
-    r"^\s*<answer>\s*(?:\\boxed|/boxed)\{(?P<inner>.*)\}\s*</answer>\s*$",
-    re.DOTALL,
-)
 VERDICT_CORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*CORRECT\s*$", re.IGNORECASE | re.MULTILINE)
 VERDICT_INCORRECT_RE = re.compile(r"^\s*VERDICT\s*:\s*INCORRECT\s*$", re.IGNORECASE | re.MULTILINE)
 ANSWER_TAG_PRESENT_RE = re.compile(r"<answer>", re.IGNORECASE)
@@ -243,13 +240,9 @@ class CanvasCRUDEnv:
         boxed_match = BOXED_RE.fullmatch(stripped)
         boxed_format_ok = boxed_match is not None
         boxed_value = boxed_match.group("inner").strip() if boxed_match else ""
-        answer_only_ok = bool(FINAL_ANSWER_ONLY_RE.fullmatch(full_message.strip())) if full_message else False
+        answer_only_ok = True
 
-        if not answer_only_ok:
-            reason = (
-                "Final turn must contain only <answer>\\boxed{...}</answer> with no extra text outside <answer>."
-            )
-        elif not boxed_format_ok:
+        if not boxed_format_ok:
             reason = "Final answer format is invalid. Use only \\boxed{...} inside <answer>."
         else:
             reason = "Answer format is valid."
@@ -260,7 +253,7 @@ class CanvasCRUDEnv:
             "boxed_format_ok": boxed_format_ok,
             "boxed_value": boxed_value,
             "answer_only_ok": answer_only_ok,
-            "format_ok": bool(boxed_format_ok and answer_only_ok),
+            "format_ok": bool(boxed_format_ok),
             "reason": reason,
         }
 
@@ -443,11 +436,22 @@ class CanvasCRUDEnv:
 
     def step(
         self,
-        action: Action,
+        action: Optional[Action] = None,
+        actions: Optional[List[Action]] = None,
         assistant_message: str = "",
         parsed_assistant: Optional[Dict[str, Any]] = None,
     ) -> EnvResponse:
-        self.actions.append(action)
+        action_list: List[Action] = []
+        if isinstance(actions, list):
+            action_list = [a for a in actions if isinstance(a, Action)]
+        elif isinstance(action, Action):
+            action_list = [action]
+        primary_action = action_list[0] if action_list else Action(name=RESPOND_ACTION_NAME, kwargs={})
+
+        if action_list:
+            self.actions.extend(action_list)
+        else:
+            self.actions.append(primary_action)
         self.assistant_messages.append(assistant_message)
 
         reward = 0.0
@@ -465,10 +469,13 @@ class CanvasCRUDEnv:
         parsed_think = str(parsed.get("think", "") or "").strip()
         tool_blocks = TOOL_CALL_BLOCK_RE.findall(raw_message) + TOOL_LEGACY_BLOCK_RE.findall(raw_message)
         tool_block_count = len(tool_blocks)
-        parsed_tool = parsed.get("tool")
-        has_valid_parsed_tool = bool(
-            isinstance(parsed_tool, dict) and str(parsed_tool.get("name", "")).strip()
-        )
+        parsed_tools_raw = parsed.get("tools")
+        if isinstance(parsed_tools_raw, list):
+            parsed_tools = [x for x in parsed_tools_raw if isinstance(x, dict) and str(x.get("name", "")).strip()]
+        else:
+            parsed_tool = parsed.get("tool")
+            parsed_tools = [parsed_tool] if isinstance(parsed_tool, dict) and str(parsed_tool.get("name", "")).strip() else []
+        parsed_tool_count = len(parsed_tools)
         policy_format_error = ""
         if not is_answer_attempt:
             if think_block_count == 0:
@@ -489,24 +496,17 @@ class CanvasCRUDEnv:
             elif tool_block_count == 0:
                 policy_format_error = (
                     "Non-final turn is missing <tool_call>. "
-                    "Output exactly one CRUD <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>."
+                    "Output at least one CRUD <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call>."
                 )
-            elif tool_block_count > 1:
-                policy_format_error = (
-                    "Non-final turn has multiple tool blocks. "
-                    "Output exactly one <tool_call> block."
-                )
-            elif not has_valid_parsed_tool:
-                raw_tool_call = str(parsed.get("raw_tool_call", "") or parsed.get("raw_tool", "") or "")
-                normalized_tool = re.sub(r"\s+", "", raw_tool_call)
-                if "}}}" in normalized_tool:
-                    policy_format_error = (
-                        "Malformed <tool_call> payload: extra closing brace detected. "
-                        "Use brace-balanced JSON, e.g. ...\"arguments\":{...}}</tool_call> (not }}})."
-                    )
-                else:
+            else:
+                if parsed_tool_count == 0:
                     policy_format_error = (
                         "Malformed <tool_call> payload. Use strict JSON with "
+                        "{\"name\":\"tool_name\",\"arguments\":{...}}."
+                    )
+                elif parsed_tool_count < tool_block_count:
+                    policy_format_error = (
+                        "At least one <tool_call> payload is malformed. Use strict JSON with "
                         "{\"name\":\"tool_name\",\"arguments\":{...}}."
                     )
 
@@ -514,22 +514,41 @@ class CanvasCRUDEnv:
             "Format rejected. Re-output this turn with EXACT structure:\n"
             "<think>one concise reasoning step</think>\n"
             "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
-            "Rules: include exactly one <think> and one <tool_call>; no extra text; "
+            "[Optional additional <tool_call>...</tool_call> blocks in same turn]\n"
+            "Rules: include exactly one <think> and at least one <tool_call>; no extra text; "
             "JSON must be valid and brace-balanced (no extra '}' )."
         )
 
+        tool_results: List[Dict[str, Any]] = []
         if policy_format_error:
             tool_obs = f"Error: {policy_format_error}"
-        elif action.name == RESPOND_ACTION_NAME:
+        elif not action_list:
             tool_obs = "No tool executed in this turn."
-        elif action.name in self.tools_map:
-            try:
-                tool_obs = self.tools_map[action.name].invoke(self.data, **action.kwargs)
-            except Exception as exc:
-                tool_obs = f"Error: {exc}"
-            action_done = action.name in self.terminate_tools
         else:
-            tool_obs = f"Unknown action {action.name}"
+            for curr_action in action_list:
+                if curr_action.name in self.tools_map:
+                    try:
+                        curr_obs = self.tools_map[curr_action.name].invoke(self.data, **curr_action.kwargs)
+                    except Exception as exc:
+                        curr_obs = f"Error: {exc}"
+                    action_done = action_done or (curr_action.name in self.terminate_tools)
+                else:
+                    curr_obs = f"Error: Unknown action {curr_action.name}"
+                tool_results.append({
+                    "action": curr_action.to_dict(),
+                    "tool_response": curr_obs,
+                })
+
+            error_results = [
+                tr for tr in tool_results
+                if str(tr.get("tool_response", "")).startswith("Error:")
+            ]
+            if error_results:
+                tool_obs = str(error_results[0].get("tool_response", "Error: tool execution failed"))
+            elif len(tool_results) == 1:
+                tool_obs = str(tool_results[0].get("tool_response", ""))
+            else:
+                tool_obs = f"Executed {len(tool_results)} tool calls successfully."
 
         rendered_canvas = canvas_snapshot(self.data)
         self.turn_id += 1
@@ -575,9 +594,11 @@ class CanvasCRUDEnv:
         critic_context = {
             "instruction": self.task.instruction,
             "assistant_message": assistant_message,
-            "assistant_action": action.to_dict(),
+            "assistant_action": primary_action.to_dict(),
+            "assistant_actions": [a.to_dict() for a in action_list],
             "assistant_parse": parsed_assistant or {},
             "tool_result": tool_obs,
+            "tool_results": tool_results,
             "target_canvas": self.target_canvas,
             "rendered_canvas": rendered_canvas,
             "target_image_path": self.target_image_path,
@@ -605,7 +626,7 @@ class CanvasCRUDEnv:
 
         if answer_candidate_for_feedback and not answer_eval.get("format_ok", False):
             critic_context["answer_error_notice"] = (
-                "Answer format is invalid. Final turn must be exactly <answer>\\boxed{...}</answer>."
+                "Answer format is invalid. Final turn must include <answer>\\boxed{...}</answer>."
             )
         if answer_candidate_for_feedback:
             critic_context["critic_output_format"] = (
@@ -627,6 +648,7 @@ class CanvasCRUDEnv:
         assistant_feedback_payload = {
             "type": "turn_feedback_bundle",
             "tool_response": tool_obs,
+            "tool_results": tool_results,
             "rendered_canvas": rendered_canvas,
             "target_canvas": self.target_canvas,
             "rendered_image_path": rendered_image_path,

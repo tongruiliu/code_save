@@ -202,8 +202,8 @@ def _observation_to_user_messages(observation: str) -> List[Dict[str, Any]]:
         text_lines.append(
             "Mandatory format for non-final turns (including turn 1): "
             "<think>one concise reasoning step</think> followed immediately by "
-            "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>. "
-            "Do not output <tool_call> alone."
+            "at least one <tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>. "
+            "You may output multiple <tool_call> blocks in the same turn."
         )
         if critic_feedback:
             text_lines.append(critic_feedback)
@@ -243,6 +243,10 @@ def _observation_to_user_messages(observation: str) -> List[Dict[str, Any]]:
 def _extract_first_tag(text: str, pattern: re.Pattern[str]) -> str:
     m = pattern.search(text)
     return m.group(1).strip() if m else ""
+
+
+def _extract_all_tags(text: str, pattern: re.Pattern[str]) -> List[str]:
+    return [m.group(1).strip() for m in pattern.finditer(text)]
 
 
 def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[str, Any]]]:
@@ -290,15 +294,30 @@ def _parse_tool_block(raw_tool: str) -> Tuple[Optional[Action], Optional[Dict[st
     return Action(name=parsed["name"], kwargs=parsed["args"]), parsed
 
 
+def _parse_tool_blocks(raw_tools: List[str]) -> Tuple[List[Action], List[Dict[str, Any]]]:
+    actions: List[Action] = []
+    tools: List[Dict[str, Any]] = []
+    for raw_tool in raw_tools:
+        action, tool_obj = _parse_tool_block(raw_tool)
+        if action is not None and tool_obj is not None:
+            actions.append(action)
+            tools.append(tool_obj)
+    return actions, tools
+
+
 def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
     content = _message_content_to_text(message.get("content")).strip()
     think = _extract_first_tag(content, THINK_RE)
-    raw_tool_call = _extract_first_tag(content, TOOL_CALL_RE)
-    raw_tool_legacy = _extract_first_tag(content, TOOL_RE)
-    raw_tool = raw_tool_call or raw_tool_legacy
+    raw_tool_calls = _extract_all_tags(content, TOOL_CALL_RE)
+    raw_tool_legacy = _extract_all_tags(content, TOOL_RE)
+    raw_tools = raw_tool_calls + raw_tool_legacy
+    raw_tool_call = raw_tools[0] if raw_tools else ""
+    raw_tool = raw_tool_call
     answer = _extract_first_tag(content, ANSWER_RE)
 
-    action, tool_obj = _parse_tool_block(raw_tool)
+    actions, tool_objs = _parse_tool_blocks(raw_tools)
+    action = actions[0] if actions else None
+    tool_obj = tool_objs[0] if tool_objs else None
 
     if action is None:
         respond_text = answer if answer else content
@@ -307,9 +326,11 @@ def message_to_action(message: Dict[str, Any]) -> Tuple[Action, Dict[str, Any]]:
     parsed = {
         "think": think,
         "tool": tool_obj,
+        "tools": tool_objs,
         "answer": answer,
         "raw_tool_call": raw_tool_call,
         "raw_tool": raw_tool,
+        "raw_tool_calls": raw_tools,
     }
     return action, parsed
 
@@ -329,16 +350,23 @@ def _validate_nonfinal_format(parsed: Dict[str, Any]) -> Optional[str]:
     if not think:
         return "Missing or empty <think> block."
 
-    raw_tool = str(parsed.get("raw_tool_call", "") or parsed.get("raw_tool", "") or "").strip()
-    if not raw_tool:
+    raw_tools = parsed.get("raw_tool_calls")
+    if not isinstance(raw_tools, list):
+        raw_tool = str(parsed.get("raw_tool_call", "") or parsed.get("raw_tool", "") or "").strip()
+        raw_tools = [raw_tool] if raw_tool else []
+    raw_tools = [str(x).strip() for x in raw_tools if str(x).strip()]
+    if not raw_tools:
         return "Missing <tool_call> block."
-    normalized_tool = re.sub(r"\s+", "", raw_tool)
-    if "}}}" in normalized_tool:
-        return "Malformed <tool_call> JSON: extra closing brace '}}}'."
 
-    tool_obj = parsed.get("tool")
-    if not isinstance(tool_obj, dict) or not str(tool_obj.get("name", "")).strip():
+    tool_objs = parsed.get("tools")
+    if not isinstance(tool_objs, list):
+        maybe_first = parsed.get("tool")
+        tool_objs = [maybe_first] if isinstance(maybe_first, dict) else []
+    valid_tool_objs = [x for x in tool_objs if isinstance(x, dict) and str(x.get("name", "")).strip()]
+    if not valid_tool_objs:
         return "Malformed <tool_call> payload. Use strict JSON with name + arguments."
+    if len(valid_tool_objs) < len(raw_tools):
+        return "At least one <tool_call> payload is malformed. Use strict JSON with name + arguments."
     return None
 
 
@@ -424,7 +452,8 @@ class ToolCallingAgent:
                         "Format rejected for this turn. Re-output exactly:\n"
                         "<think>one concise reasoning step</think>\n"
                         "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
-                        "Rules: include exactly one <think> and one <tool_call>; no extra text; "
+                        "[Optional additional <tool_call>...</tool_call> blocks in the same turn]\n"
+                        "Rules: include exactly one <think> and at least one <tool_call>; no extra text; "
                         "JSON must be valid and brace-balanced.\n"
                         f"Current error: {latest_format_error}"
                     )
@@ -442,8 +471,22 @@ class ToolCallingAgent:
                 context_messages.extend(format_retry_msgs)
                 trajectory_messages.extend(format_retry_msgs)
 
+            parsed_tools = parsed.get("tools") if isinstance(parsed.get("tools"), list) else []
+            actions_batch: List[Action] = []
+            for tool_obj in parsed_tools:
+                if not isinstance(tool_obj, dict):
+                    continue
+                name = str(tool_obj.get("name", "")).strip()
+                args = tool_obj.get("args")
+                if not name or not isinstance(args, dict):
+                    continue
+                actions_batch.append(Action(name=name, kwargs=args))
+            if not actions_batch and action.name != RESPOND_ACTION_NAME:
+                actions_batch.append(action)
+
             env_res = env.step(
                 action=action,
+                actions=actions_batch,
                 assistant_message=assistant_raw,
                 parsed_assistant=parsed,
             )
@@ -458,10 +501,12 @@ class ToolCallingAgent:
                     "assistant_visible": assistant_visible,
                     "assistant_think": parsed.get("think", ""),
                     "assistant_tool": parsed.get("tool"),
+                    "assistant_tools": parsed.get("tools", []),
                     "assistant_answer": parsed.get("answer", ""),
                     "assistant_usage": assistant_usage,
                     "critic_usage": critic_usage,
                     "action": action.to_dict(),
+                    "actions": [a.to_dict() for a in actions_batch],
                     "critic_feedback": critic_feedback_compact,
                     "critic_feedback_raw_len": len(env_res.observation or ""),
                     "reward": env_res.reward,
