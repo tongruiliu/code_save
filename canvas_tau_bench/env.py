@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Type
 from bs4 import BeautifulSoup, NavigableString
 
 from .blackboard_tools import blackboard_tools
-from .tools import ALL_TOOLS, Tool, canvas_snapshot, init_canvas_data
+from .canvas_blackboard_backend import Blackboard
+from .tools import ALL_TOOLS, Tool, init_canvas_data
 from .types import (
     Action,
     EnvInfo,
@@ -24,7 +25,6 @@ from .types import (
     Task,
 )
 from .user import load_user
-
 
 CANVAS_WIKI_TEMPLATE = """# Objective #
 You are a **Visual-Reasoning Agent**, solving complex problems by synchronizing a visual Chain-of-Thought on a virtual notebook.
@@ -115,6 +115,15 @@ class CanvasCRUDEnv:
         provided_tools = json.dumps(self.tools_info, ensure_ascii=False, indent=2)
         self.wiki = CANVAS_WIKI_TEMPLATE.replace("{provided_tools}", provided_tools)
         self.terminate_tools = {"finish_canvas"}
+        self.canvas_backend_actions = {
+            "insert_element",
+            "modify_element",
+            "remove_element",
+            "replace_element",
+            "clear",
+            "clear_element",
+        }
+        self.blackboard = Blackboard()
         self.critic = load_user(
             user_strategy,
             model=user_model,
@@ -143,6 +152,7 @@ class CanvasCRUDEnv:
             self.task_index = task_index
         self.task = self.tasks[self.task_index]
         self.data = init_canvas_data()
+        self.blackboard = Blackboard()
         self.actions = []
         self.assistant_messages = []
         self.answer_history = []
@@ -159,9 +169,9 @@ class CanvasCRUDEnv:
 
         if isinstance(task_target_canvas, dict) and task_target_canvas:
             self.target_canvas = task_target_canvas
-            # If task directly provides target canvas in our state format, allow hash-based match.
-            if self._looks_like_canvas_state(task_target_canvas):
-                self.gt_hash = self._data_hash(task_target_canvas)
+            # Canvas backend runtime state differs from legacy tree-state target hash;
+            # keep critic-driven reward as the source of truth.
+            self.gt_hash = None
 
         if task_target_url:
             self.target_image_url = task_target_url
@@ -434,6 +444,17 @@ class CanvasCRUDEnv:
         # and convert to data URL only right before model call.
         return path, ""
 
+    def _render_blackboard_state(self, prefix: str) -> tuple[str, str, str]:
+        filename = f"{prefix}-turn-{self.turn_id:03d}.png"
+        path = os.path.join(self.render_dir, filename)
+        try:
+            result = self.blackboard.render_state(path)
+        except Exception as exc:
+            return path, "", f"Error: {exc}"
+        if str(result).strip() != "tool execute success":
+            return path, "", f"Error: {result}"
+        return path, "", ""
+
     def step(
         self,
         action: Optional[Action] = None,
@@ -526,12 +547,22 @@ class CanvasCRUDEnv:
             tool_obs = "No tool executed in this turn."
         else:
             for curr_action in action_list:
-                if curr_action.name in self.tools_map:
+                if curr_action.name in self.canvas_backend_actions:
                     try:
-                        curr_obs = self.tools_map[curr_action.name].invoke(self.data, **curr_action.kwargs)
+                        self.blackboard.update_state(action=curr_action.name, attrs=dict(curr_action.kwargs or {}))
+                        curr_obs = "tool execute success"
                     except Exception as exc:
                         curr_obs = f"Error: {exc}"
-                    action_done = action_done or (curr_action.name in self.terminate_tools)
+                elif curr_action.name in self.terminate_tools:
+                    curr_obs = json.dumps(
+                        {
+                            "status": "ok",
+                            "action": "finish_canvas",
+                            "summary": str((curr_action.kwargs or {}).get("summary", "")),
+                        },
+                        ensure_ascii=False,
+                    )
+                    action_done = True
                 else:
                     curr_obs = f"Error: Unknown action {curr_action.name}"
                 tool_results.append({
@@ -550,14 +581,18 @@ class CanvasCRUDEnv:
             else:
                 tool_obs = f"Executed {len(tool_results)} tool calls successfully."
 
-        rendered_canvas = canvas_snapshot(self.data)
+        rendered_canvas = {
+            "backend": "canvas_blackboard",
+            "state_hash": hashlib.sha256(str(getattr(self.blackboard, "state", "")).encode("utf-8")).hexdigest(),
+        }
         self.turn_id += 1
-        rendered_image_path, rendered_image_url = self._render_snapshot(
-            snapshot=rendered_canvas,
-            prefix="rendered",
-            title=f"Rendered Canvas Turn {self.turn_id}",
-            data_state=self.data,
-        )
+        rendered_image_path, rendered_image_url, render_error = self._render_blackboard_state(prefix="rendered")
+        if not tool_obs.startswith("Error:") and render_error:
+            tool_obs = render_error
+        self.data = {
+            "backend": "canvas_blackboard",
+            "state_hash": rendered_canvas["state_hash"],
+        }
         current_hash = self._data_hash(self.data)
         matches_target: Optional[bool] = (current_hash == self.gt_hash) if self.gt_hash else None
         lenient_match = ANSWER_LENIENT_RE.search(raw_message)

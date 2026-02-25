@@ -13,6 +13,7 @@ A standalone minimal implementation independent of `tau-bench`:
 - `env.py`: Canvas CRUD environment, critic feedback loop, and reward logic.
 - `tools.py`: Canvas CRUD tool definitions and execution.
 - `blackboard_tools.py`: Canvas-style tool schema registry (injected into prompt).
+- Runtime execution backend is vendored locally as `canvas_blackboard_backend.py` (ported from Canvas-CoT `Blackboard`) for CRUD updates and rendering.
 - `user.py`: Critic simulator with `scripted / human / llm` strategies.
 - `types.py`: Data structure definitions.
 
