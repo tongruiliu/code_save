@@ -205,6 +205,23 @@ def _observation_to_user_messages(observation: str) -> List[Dict[str, Any]]:
             "at least one <tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>. "
             "You may output multiple <tool_call> blocks in the same turn."
         )
+        text_lines.append(
+            "Use step-by-step thinking in <think> with 1-3 short markdown bullets "
+            "(observation -> next action -> expected check)."
+        )
+        text_lines.append(
+            "Allowed tool names only: insert_element, modify_element, remove_element, replace_element, clear. "
+            "Any other tool name (e.g., plan/shell) is invalid."
+        )
+        text_lines.append(
+            "Required args by tool: insert_element(fragment, rootId), modify_element(targetId, attrs), "
+            "remove_element(targetId), replace_element(targetId, fragment), clear({}). "
+            "Do not invent keys like id/type/content/filter/changes."
+        )
+        text_lines.append(
+            "Do not output final answer in turn 1. Prefer at least one successful tool update before <answer>. "
+            "Never use placeholder answers like \\boxed{final_answer} or \\boxed{done}."
+        )
         if critic_feedback:
             text_lines.append(critic_feedback)
         text_block = "\n".join(text_lines).strip() or observation

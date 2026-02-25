@@ -36,6 +36,11 @@ The primary goal is **100% accuracy**.
 - Output one concise `<think>...</think>` block.
 - Each turn should contain only a small part of reasoning.
 - Use critic feedback and tool results to fix prior mistakes.
+- Inside `<think>`, use 1-3 short markdown bullets (`- ...`) for:
+  - current visual observation,
+  - one immediate action plan,
+  - expected correction/check.
+- Do NOT include `<answer>`/`<tool_call>` literal examples inside `<think>`.
 
 # Step 2: Tool Call
 - Immediately after `<think>`, call notebook tool(s).
@@ -48,12 +53,25 @@ The primary goal is **100% accuracy**.
 - Non-final turns must contain exactly one `<think>` and at least one `<tool_call>`.
 - Turn 1 is NOT an exception.
 - Tool-call JSON must be valid and brace-balanced.
+- Only these tool names are allowed: `insert_element`, `modify_element`, `remove_element`, `replace_element`, `clear`.
+- Any other tool name (e.g., `plan`, `shell`) is invalid.
+- Use exact required arguments by tool:
+  - `insert_element`: `fragment`, `rootId`
+  - `modify_element`: `targetId`, `attrs`
+  - `remove_element`: `targetId`
+  - `replace_element`: `targetId`, `fragment`
+  - `clear`: empty object `{}`
+- Do not invent generic argument keys like `id`, `type`, `content`, `filter`, `changes`.
 - Use strict payload:
   {"name":"tool_name","arguments":{...}}
   ({"name":"tool_name","args":{...}} is also accepted.)
 - Final turn must include:
   <answer>\\boxed{final_answer}</answer>
 - In final turn, tool calls are optional.
+- Avoid early answer: do NOT output final `<answer>` in turn 1.
+- Prefer at least one successful notebook update before final `<answer>`.
+- If critic reports mismatch/format issue, continue with one corrective tool step instead of answering.
+- Never output placeholder answers such as `\\boxed{final_answer}` or `\\boxed{done}`.
 
 # Notebook Operation Restrictions #
 - Keep structure clean, incremental, and non-overlapping.
@@ -79,6 +97,11 @@ For each function call, return a JSON object with function name and arguments in
 
 2) Final turn
 <answer>\\boxed{done}</answer>
+
+# Anti-Pattern Examples (Do Not Do) #
+- `<answer>\\boxed{final_answer}</answer>` (placeholder)
+- Putting tutorial/explanatory text outside `<think>/<tool_call>/<answer>`
+- Writing `<answer>...</answer>` inside `<think>`
 """
 
 BOXED_RE = re.compile(r"^(?:\\boxed|/boxed)\{(?P<inner>.*)\}$", re.DOTALL)
@@ -109,6 +132,14 @@ class CanvasCRUDEnv:
             t.get_info()["function"]["name"]: t for t in ALL_TOOLS
         }
         self.tools_info = json.loads(json.dumps(blackboard_tools))
+        self.tool_schema_map: Dict[str, Dict[str, Any]] = {}
+        for t in self.tools_info:
+            fn = t.get("function", {}) if isinstance(t, dict) else {}
+            name = str(fn.get("name", "")).strip()
+            params = fn.get("parameters", {}) if isinstance(fn.get("parameters", {}), dict) else {}
+            if name:
+                self.tool_schema_map[name] = params
+        self.model_tool_names = set(self.tool_schema_map.keys())
         provided_tools = json.dumps(self.tools_info, ensure_ascii=False, indent=2)
         self.wiki = CANVAS_WIKI_TEMPLATE.replace("{provided_tools}", provided_tools)
         self.canvas_backend_actions = {
@@ -221,6 +252,108 @@ class CanvasCRUDEnv:
 
     def _looks_like_canvas_state(self, data: Dict[str, Any]) -> bool:
         return all(k in data for k in ("id", "tag", "children"))
+
+    def _blackboard_state_hash(self) -> str:
+        return hashlib.sha256(str(getattr(self.blackboard, "state", "")).encode("utf-8")).hexdigest()
+
+    def _blackboard_has_id(self, element_id: str) -> bool:
+        eid = str(element_id or "").strip()
+        if not eid:
+            return False
+        try:
+            parser = str(getattr(self.blackboard, "parser", "html.parser") or "html.parser")
+            soup = BeautifulSoup(str(getattr(self.blackboard, "state", "")), parser)
+            return soup.find(id=eid) is not None
+        except Exception:
+            return False
+
+    def _first_fragment_tag(self, fragment: str) -> Optional[Any]:
+        parser = str(getattr(self.blackboard, "parser", "html.parser") or "html.parser")
+        frag_soup = BeautifulSoup(fragment, parser)
+        for tag in frag_soup.find_all(True):
+            if str(tag.name).lower() not in {"html", "head", "body"}:
+                return tag
+        return None
+
+    def _validate_tool_arguments(self, name: str, args: Any, check_state: bool = True) -> Optional[str]:
+        tool_name = str(name or "").strip()
+        if tool_name not in self.model_tool_names:
+            return (
+                f"Invalid tool name '{tool_name}'. "
+                "Allowed tools: insert_element, modify_element, remove_element, replace_element, clear."
+            )
+        if not isinstance(args, dict):
+            return f"Tool '{tool_name}' arguments must be a JSON object."
+
+        schema = self.tool_schema_map.get(tool_name, {})
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            missing = [k for k in required if k not in args]
+            if missing:
+                return f"Tool '{tool_name}' missing required arguments: {', '.join(missing)}."
+
+        if tool_name == "insert_element":
+            fragment = args.get("fragment")
+            root_id = args.get("rootId")
+            if not isinstance(fragment, str) or not fragment.strip():
+                return "insert_element.fragment must be a non-empty HTML/SVG string."
+            if not isinstance(root_id, str) or not root_id.strip():
+                return "insert_element.rootId must be a non-empty string."
+            first_tag = self._first_fragment_tag(fragment)
+            if first_tag is None:
+                return "insert_element.fragment must contain at least one element tag."
+            if not first_tag.get("id"):
+                return "insert_element.fragment must include an element id attribute."
+
+            before_id = args.get("beforeId")
+            if before_id is not None and (not isinstance(before_id, str) or not before_id.strip()):
+                return "insert_element.beforeId must be a non-empty string or null."
+
+            if check_state:
+                if root_id != "root" and not self._blackboard_has_id(root_id):
+                    return f"insert_element.rootId '{root_id}' does not exist."
+                if isinstance(before_id, str) and before_id.strip() and not self._blackboard_has_id(before_id):
+                    return f"insert_element.beforeId '{before_id}' does not exist."
+
+        elif tool_name == "modify_element":
+            target_id = args.get("targetId")
+            attrs = args.get("attrs")
+            if not isinstance(target_id, str) or not target_id.strip():
+                return "modify_element.targetId must be a non-empty string."
+            if not isinstance(attrs, dict) or len(attrs) == 0:
+                return "modify_element.attrs must be a non-empty object."
+            if check_state and not self._blackboard_has_id(target_id):
+                return f"modify_element.targetId '{target_id}' does not exist."
+
+        elif tool_name == "remove_element":
+            target_id = args.get("targetId")
+            if not isinstance(target_id, str) or not target_id.strip():
+                return "remove_element.targetId must be a non-empty string."
+            if target_id == "root":
+                return "remove_element.targetId cannot be 'root'."
+            if check_state and not self._blackboard_has_id(target_id):
+                return f"remove_element.targetId '{target_id}' does not exist."
+
+        elif tool_name == "replace_element":
+            target_id = args.get("targetId")
+            fragment = args.get("fragment")
+            if not isinstance(target_id, str) or not target_id.strip():
+                return "replace_element.targetId must be a non-empty string."
+            if not isinstance(fragment, str) or not fragment.strip():
+                return "replace_element.fragment must be a non-empty HTML/SVG string."
+            first_tag = self._first_fragment_tag(fragment)
+            if first_tag is None:
+                return "replace_element.fragment must contain at least one element tag."
+            if not first_tag.get("id"):
+                return "replace_element.fragment must include an element id attribute."
+            if check_state and not self._blackboard_has_id(target_id):
+                return f"replace_element.targetId '{target_id}' does not exist."
+
+        elif tool_name == "clear":
+            if len(args) != 0:
+                return "clear arguments must be an empty object {}."
+
+        return None
 
     def calculate_reward(self, critic_correct: bool) -> tuple[float, RewardInfo]:
         actual_hash = self._data_hash(self.data)
@@ -492,6 +625,21 @@ class CanvasCRUDEnv:
             parsed_tool = parsed.get("tool")
             parsed_tools = [parsed_tool] if isinstance(parsed_tool, dict) and str(parsed_tool.get("name", "")).strip() else []
         parsed_tool_count = len(parsed_tools)
+        parsed_tool_names = [str(x.get("name", "")).strip() for x in parsed_tools]
+        invalid_tool_names = [n for n in parsed_tool_names if n not in self.model_tool_names]
+        invalid_tool_arg_errors: List[str] = []
+        if parsed_tools and not invalid_tool_names:
+            for tool_obj in parsed_tools:
+                name = str(tool_obj.get("name", "")).strip()
+                raw_args = tool_obj.get("kwargs")
+                if raw_args is None:
+                    raw_args = tool_obj.get("args")
+                if raw_args is None:
+                    raw_args = tool_obj.get("arguments")
+                arg_error = self._validate_tool_arguments(name=name, args=raw_args, check_state=False)
+                if arg_error:
+                    invalid_tool_arg_errors.append(arg_error)
+                    break
         policy_format_error = ""
         if not is_answer_attempt:
             if think_block_count == 0:
@@ -525,6 +673,33 @@ class CanvasCRUDEnv:
                         "At least one <tool_call> payload is malformed. Use strict JSON with "
                         "{\"name\":\"tool_name\",\"arguments\":{...}}."
                     )
+                elif invalid_tool_arg_errors:
+                    policy_format_error = invalid_tool_arg_errors[0]
+                elif invalid_tool_names:
+                    policy_format_error = (
+                        f"Invalid tool name(s): {', '.join(invalid_tool_names)}. "
+                        "Allowed tools: insert_element, modify_element, remove_element, replace_element, clear."
+                    )
+        else:
+            # Final turn may omit tool calls, but if tool calls are present they must be valid CRUD tools.
+            if tool_block_count > 0:
+                if parsed_tool_count == 0:
+                    policy_format_error = (
+                        "Malformed <tool_call> payload. Use strict JSON with "
+                        "{\"name\":\"tool_name\",\"arguments\":{...}}."
+                    )
+                elif parsed_tool_count < tool_block_count:
+                    policy_format_error = (
+                        "At least one <tool_call> payload is malformed. Use strict JSON with "
+                        "{\"name\":\"tool_name\",\"arguments\":{...}}."
+                    )
+                elif invalid_tool_arg_errors:
+                    policy_format_error = invalid_tool_arg_errors[0]
+                elif invalid_tool_names:
+                    policy_format_error = (
+                        f"Invalid tool name(s) in final turn: {', '.join(invalid_tool_names)}. "
+                        "Allowed tools: insert_element, modify_element, remove_element, replace_element, clear."
+                    )
 
         format_repair_notice = (
             "Format rejected. Re-output this turn with EXACT structure:\n"
@@ -532,6 +707,9 @@ class CanvasCRUDEnv:
             "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
             "[Optional additional <tool_call>...</tool_call> blocks in same turn]\n"
             "Rules: include exactly one <think> and at least one <tool_call>; no extra text; "
+            "tool name must be one of insert_element/modify_element/remove_element/replace_element/clear; "
+            "arguments must match tool schema (insert: fragment+rootId, modify: targetId+attrs, "
+            "remove: targetId, replace: targetId+fragment, clear: {}); "
             "JSON must be valid and brace-balanced (no extra '}' )."
         )
 
@@ -544,8 +722,25 @@ class CanvasCRUDEnv:
             for curr_action in action_list:
                 if curr_action.name in self.canvas_backend_actions:
                     try:
-                        self.blackboard.update_state(action=curr_action.name, attrs=dict(curr_action.kwargs or {}))
-                        curr_obs = "tool execute success"
+                        curr_kwargs = dict(curr_action.kwargs or {})
+                        validation_error = self._validate_tool_arguments(
+                            name=curr_action.name,
+                            args=curr_kwargs,
+                            check_state=True,
+                        )
+                        if validation_error:
+                            curr_obs = f"Error: {validation_error}"
+                        else:
+                            old_hash = self._blackboard_state_hash()
+                            self.blackboard.update_state(action=curr_action.name, attrs=curr_kwargs)
+                            new_hash = self._blackboard_state_hash()
+                            if new_hash == old_hash:
+                                curr_obs = (
+                                    f"Error: Tool '{curr_action.name}' produced no state change. "
+                                    "Check ids/arguments and avoid no-op calls."
+                                )
+                            else:
+                                curr_obs = "tool execute success"
                     except Exception as exc:
                         curr_obs = f"Error: {exc}"
                 else:
@@ -655,8 +850,15 @@ class CanvasCRUDEnv:
                 "FEEDBACK: <next-step feedback or closure>"
             )
 
-        if policy_format_error and not answer_candidate_for_feedback:
-            critic_feedback = format_repair_notice
+        if policy_format_error:
+            if answer_candidate_for_feedback:
+                critic_feedback = (
+                    f"{format_repair_notice}\n"
+                    "Answer candidate detected, but this turn is rejected due to format/tool-name violation. "
+                    "Re-output with valid format first."
+                )
+            else:
+                critic_feedback = format_repair_notice
             self.last_critic_usage = {}
         else:
             critic_feedback = self.critic.step(assistant_message=assistant_message, context=critic_context)
@@ -678,7 +880,7 @@ class CanvasCRUDEnv:
         }
         obs = json.dumps(assistant_feedback_payload, ensure_ascii=False)
 
-        critic_verdict = self._parse_critic_verdict(critic_feedback) if has_answer else None
+        critic_verdict = self._parse_critic_verdict(critic_feedback) if (has_answer and not policy_format_error) else None
         done = bool(has_answer and critic_verdict is True)
         if has_answer:
             critic_context["critic_verdict"] = critic_verdict
