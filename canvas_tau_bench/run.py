@@ -33,14 +33,12 @@ def build_demo_tasks() -> List[Task]:
                 "1) Insert <div id='plan'>draft</div> into root; "
                 "2) Modify plan text to 'step-1 complete'; "
                 "3) Replace plan with <div id='final_card'>done</div>; "
-                "4) Call finish_canvas after completion; "
-                "5) Reply with done."
+                "4) Reply with done."
             ),
             actions=[
                 Action(name="insert_element", kwargs={"fragment": "<div id='plan'>draft</div>", "rootId": "root"}),
                 Action(name="modify_element", kwargs={"targetId": "plan", "attrs": {"text": "step-1 complete"}}),
                 Action(name="replace_element", kwargs={"targetId": "plan", "fragment": "<div id='final_card'>done</div>"}),
-                Action(name="finish_canvas", kwargs={"summary": "task completed"}),
             ],
             outputs=["done"],
         ),
@@ -50,14 +48,13 @@ def build_demo_tasks() -> List[Task]:
                 "Create two nodes and validate ordering: "
                 "first insert <div id='a'>A</div>, then insert <div id='b'>B</div>; "
                 "next insert <div id='c'>C</div> with beforeId='b'; "
-                "then remove a; finally call finish_canvas and reply with done."
+                "then remove a; finally reply with done."
             ),
             actions=[
                 Action(name="insert_element", kwargs={"fragment": "<div id='a'>A</div>", "rootId": "root"}),
                 Action(name="insert_element", kwargs={"fragment": "<div id='b'>B</div>", "rootId": "root"}),
                 Action(name="insert_element", kwargs={"fragment": "<div id='c'>C</div>", "rootId": "root", "beforeId": "b"}),
                 Action(name="remove_element", kwargs={"targetId": "a"}),
-                Action(name="finish_canvas", kwargs={"summary": "ordered insert and remove complete"}),
             ],
             outputs=["done"],
         ),
@@ -67,13 +64,12 @@ def build_demo_tasks() -> List[Task]:
                 "First insert <div id='tmp'>temp</div>, "
                 "then call clear, "
                 "then insert <div id='result'>ok</div>; "
-                "finally call finish_canvas and reply with done."
+                "finally reply with done."
             ),
             actions=[
                 Action(name="insert_element", kwargs={"fragment": "<div id='tmp'>temp</div>", "rootId": "root"}),
                 Action(name="clear", kwargs={}),
                 Action(name="insert_element", kwargs={"fragment": "<div id='result'>ok</div>", "rootId": "root"}),
-                Action(name="finish_canvas", kwargs={"summary": "clear flow complete"}),
             ],
             outputs=["done"],
         ),

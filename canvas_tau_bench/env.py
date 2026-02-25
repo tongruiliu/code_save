@@ -109,12 +109,8 @@ class CanvasCRUDEnv:
             t.get_info()["function"]["name"]: t for t in ALL_TOOLS
         }
         self.tools_info = json.loads(json.dumps(blackboard_tools))
-        finish_tool = self.tools_map.get("finish_canvas")
-        if finish_tool is not None:
-            self.tools_info.append(finish_tool.get_info())
         provided_tools = json.dumps(self.tools_info, ensure_ascii=False, indent=2)
         self.wiki = CANVAS_WIKI_TEMPLATE.replace("{provided_tools}", provided_tools)
-        self.terminate_tools = {"finish_canvas"}
         self.canvas_backend_actions = {
             "insert_element",
             "modify_element",
@@ -477,7 +473,6 @@ class CanvasCRUDEnv:
 
         reward = 0.0
         info = EnvInfo(task=self.task)
-        action_done = False
         raw_message = str(assistant_message or "")
         parsed = parsed_assistant or {}
         answer_text = str(parsed.get("answer", "")).strip()
@@ -553,16 +548,6 @@ class CanvasCRUDEnv:
                         curr_obs = "tool execute success"
                     except Exception as exc:
                         curr_obs = f"Error: {exc}"
-                elif curr_action.name in self.terminate_tools:
-                    curr_obs = json.dumps(
-                        {
-                            "status": "ok",
-                            "action": "finish_canvas",
-                            "summary": str((curr_action.kwargs or {}).get("summary", "")),
-                        },
-                        ensure_ascii=False,
-                    )
-                    action_done = True
                 else:
                     curr_obs = f"Error: Unknown action {curr_action.name}"
                 tool_results.append({
@@ -641,7 +626,6 @@ class CanvasCRUDEnv:
             "rendered_image_path": rendered_image_path,
             "rendered_image_url": rendered_image_url,
             "matches_target": matches_target,
-            "action_terminated": action_done,
             "answer_evaluation": answer_eval,
             "policy_format_error": policy_format_error,
             "format_repair_notice": format_repair_notice if policy_format_error else "",

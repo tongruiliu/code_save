@@ -345,34 +345,10 @@ class ClearCanvas(Tool):
         }
 
 
-class FinishCanvas(Tool):
-    @staticmethod
-    def invoke(data: Dict[str, Any], summary: str = "") -> str:
-        return json.dumps({"status": "ok", "action": "finish_canvas", "summary": summary}, ensure_ascii=False)
-
-    @staticmethod
-    def get_info() -> Dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": "finish_canvas",
-                "description": "Call this when all requested canvas operations are complete.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {"type": "string"},
-                    },
-                    "required": [],
-                },
-            },
-        }
-
-
 ALL_TOOLS = [
     InsertElement,
     ModifyElement,
     ReplaceElement,
     RemoveElement,
     ClearCanvas,
-    FinishCanvas,
 ]

@@ -230,7 +230,6 @@ class ScriptedUserSimulation(BaseUserSimulation):
         matches_target_raw = context.get("matches_target", None)
         has_match_signal = isinstance(matches_target_raw, bool)
         matches_target = bool(matches_target_raw)
-        action_terminated = bool(context.get("action_terminated"))
         policy_format_error = str(context.get("policy_format_error", "") or "").strip()
 
         if policy_format_error and not has_answer:
@@ -279,8 +278,6 @@ class ScriptedUserSimulation(BaseUserSimulation):
             return "Canvas now matches target. Provide final output including <answer>\\boxed{...}</answer>."
         if tool_result.startswith("Error:"):
             return "The last tool action failed. Fix the arguments and try again with one CRUD action."
-        if action_terminated and not has_answer:
-            return "finish_canvas was called but final answer is missing. Provide final output including <answer>\\boxed{...}</answer>."
         if self.turn <= 2:
             return "Target not matched yet. Continue with one concrete CRUD operation."
         if self.turn <= 4:

@@ -2,7 +2,7 @@
 
 A standalone minimal implementation independent of `tau-bench`:
 - Keeps a **multi-turn policy-vs-critic loop** for distillation data generation.
-- Uses **Canvas CRUD** operations (`insert/modify/replace/remove/clear/finish`) as the action space.
+- Uses **Canvas CRUD** operations (`insert/modify/replace/remove/clear`) as the action space.
 - Keeps optional state-hash consistency scoring when a structured `target_canvas` is provided.
 - Exports assistant-turn SFT records in JSONL format.
 
@@ -116,7 +116,6 @@ python /m2/slz/lrt/canvas_tau_bench/run.py \
 
 - This is a standalone implementation and does not modify original `tau-bench` code.
 - Three demo tasks are included by default. You can replace them in `build_demo_tasks()` inside `run.py`.
-- `finish_canvas` is treated as a normal tool action; only critic-accepted final answer ends the episode.
 - By default, results are saved as:
   - `*.json`: full trajectories and reward metadata
   - `*.sft.jsonl`: assistant-turn SFT records (`messages` + `assistant_target` + `turn_meta`)

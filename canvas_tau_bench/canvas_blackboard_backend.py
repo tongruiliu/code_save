@@ -20,7 +20,12 @@ _DEFAULT_STATE = """
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Notebook State</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; }
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
     body {
       font-family: sans-serif;
       line-height: 1.6;
@@ -29,6 +34,7 @@ _DEFAULT_STATE = """
       margin: 0;
       padding: 20px;
     }
+
     main {
       max-width: 800px;
       margin: 20px auto;
@@ -37,7 +43,83 @@ _DEFAULT_STATE = """
       border-radius: 8px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
     }
-    img { max-width: 100%; height: auto; display: block; }
+
+    h1, h2 {
+      border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 10px;
+      color: #1a2c3b;
+    }
+
+    p {
+      margin-top: 0;
+    }
+
+    section {
+      margin-bottom: 30px;
+    }
+
+    section:nth-of-type(1) > div {
+      padding: 20px;
+      border: 2px dashed #666;
+      background-color: #f0f0f0;
+    }
+
+    section:nth-of-type(1) > div > div {
+      padding: 15px;
+      border: 1px solid;
+      color: #fff;
+      margin-bottom: 10px;
+    }
+
+    section:nth-of-type(1) > div > div:first-of-type {
+      background-color: #009E5F;
+      border-color: #007A4B;
+    }
+
+    section:nth-of-type(1) > div > div:last-of-type {
+      background-color: #ED2633;
+      border-color: #B81E27;
+      width: 550px;
+    }
+
+    main img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    main figure {
+      border: 2px solid #1377EB;
+      padding: 10px;
+      margin: 0 0 20px 0;
+    }
+
+    section:nth-of-type(3) > div {
+      display: flex;
+      gap: 20px;
+    }
+
+    section:nth-of-type(3) > div > article {
+      flex: 1;
+      border: 1px solid #ccc;
+      padding: 15px;
+      border-radius: 5px;
+      background: #fafafa;
+      min-height: 120px;
+    }
+
+    section:nth-of-type(4) > div {
+      border: 2px solid #f2994a;
+      padding: 15px;
+      background-color: #fff8f2;
+      overflow-wrap: break-word;
+      word-wrap: break-word;
+    }
+
+    section:nth-of-type(4) > div > p:last-of-type {
+      font-size: 0.9em;
+      color: #777;
+    }
   </style>
 </head>
 <body>
@@ -218,4 +300,3 @@ class Blackboard:
                 return "tool execute success"
         except Exception as exc:
             return f"tool execute failed: {exc}"
-
