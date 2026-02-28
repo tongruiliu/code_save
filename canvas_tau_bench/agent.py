@@ -71,7 +71,7 @@ def _path_or_url_to_data_url(value: str, cache: Dict[str, str]) -> str:
         return v
     path = v[7:] if v.startswith("file://") else v
     if not os.path.exists(path):
-        return v
+        return ""
     if path in cache:
         return cache[path]
     mime, _ = mimetypes.guess_type(path)
@@ -102,7 +102,10 @@ def _materialize_messages_for_model(messages: List[Dict[str, Any]], cache: Dict[
                 if isinstance(item, dict) and item.get("type") == "image_url":
                     image_obj = dict(item.get("image_url", {}) or {})
                     url_val = str(image_obj.get("url", "") or "").strip()
-                    image_obj["url"] = _path_or_url_to_data_url(url_val, cache)
+                    resolved_url = _path_or_url_to_data_url(url_val, cache)
+                    if not resolved_url:
+                        continue
+                    image_obj["url"] = resolved_url
                     new_item = dict(item)
                     new_item["image_url"] = image_obj
                     new_content.append(new_item)

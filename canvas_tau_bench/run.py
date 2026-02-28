@@ -9,6 +9,7 @@ from datetime import datetime
 from math import comb
 from typing import Any, Dict, List, Optional
 
+import litellm
 from litellm import provider_list
 
 if __package__ is None or __package__ == "":
@@ -281,7 +282,16 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _configure_litellm() -> None:
+    # Suppress LiteLLM's generic issue-reporting banner on every exception.
+    if hasattr(litellm, "suppress_debug_info"):
+        litellm.suppress_debug_info = True
+    if hasattr(litellm, "set_verbose"):
+        litellm.set_verbose = False
+
+
 def main() -> None:
+    _configure_litellm()
     args = parse_args()
     random.seed(args.seed)
 
@@ -377,7 +387,16 @@ def main() -> None:
                     trial=trial,
                 )
 
-            print(("PASS" if result.reward == 1 else "FAIL"), f"task_id={idx}", f"reward={result.reward}")
+            status = "PASS" if result.reward == 1 else "FAIL"
+            if status == "FAIL":
+                err = str((result.info or {}).get("error", "")).strip()
+                if err:
+                    err_line = err.splitlines()[0][:240]
+                    print(status, f"task_id={idx}", f"reward={result.reward}", f"error={err_line}")
+                else:
+                    print(status, f"task_id={idx}", f"reward={result.reward}")
+            else:
+                print(status, f"task_id={idx}", f"reward={result.reward}")
             results.append(result)
 
     display_metrics(results)

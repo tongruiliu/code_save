@@ -164,11 +164,15 @@ class CanvasCRUDEnv:
         self.target_canvas: Dict[str, Any] = {}
         self.gt_hash: Optional[str] = None
         self.session_id = uuid.uuid4().hex[:10]
-        self.render_dir = os.path.join("/tmp", "canvas_tau_bench_svg", self.session_id)
+        render_root = os.environ.get("CANVAS_RENDER_DIR", "").strip()
+        if not render_root:
+            render_root = os.path.join(os.path.dirname(__file__), "results", "renders")
+        self.render_dir = os.path.join(render_root, self.session_id)
         os.makedirs(self.render_dir, exist_ok=True)
         self.turn_id = 0
         self.target_image_path = ""
         self.target_image_url = ""
+        self.last_rendered_image_path = ""
         self.actions: List[Action] = []
         self.assistant_messages: List[str] = []
         self.answer_history: List[str] = []
@@ -188,6 +192,7 @@ class CanvasCRUDEnv:
         self.target_canvas = {}
         self.target_image_path = ""
         self.target_image_url = ""
+        self.last_rendered_image_path = ""
         self.gt_hash = None
 
         task_target_url = str(getattr(self.task, "target_image_url", "") or "").strip()
@@ -582,6 +587,8 @@ class CanvasCRUDEnv:
             return path, "", f"Error: {exc}"
         if str(result).strip() != "tool execute success":
             return path, "", f"Error: {result}"
+        if (not os.path.isfile(path)) or os.path.getsize(path) <= 0:
+            return path, "", "Error: Render reported success but output image is missing or empty."
         return path, "", ""
 
     def step(
@@ -767,6 +774,17 @@ class CanvasCRUDEnv:
         }
         self.turn_id += 1
         rendered_image_path, rendered_image_url, render_error = self._render_blackboard_state(prefix="rendered")
+        if render_error:
+            fallback = self.last_rendered_image_path
+            if fallback and os.path.isfile(fallback) and os.path.getsize(fallback) > 0:
+                rendered_image_path = fallback
+                rendered_image_url = ""
+                render_error = f"{render_error} Using previous rendered image as fallback."
+            else:
+                rendered_image_path = ""
+                rendered_image_url = ""
+        else:
+            self.last_rendered_image_path = rendered_image_path
         if not tool_obs.startswith("Error:") and render_error:
             tool_obs = render_error
         self.data = {
@@ -820,6 +838,7 @@ class CanvasCRUDEnv:
             "target_image_url": self.target_image_url,
             "rendered_image_path": rendered_image_path,
             "rendered_image_url": rendered_image_url,
+            "render_error": render_error,
             "matches_target": matches_target,
             "answer_evaluation": answer_eval,
             "policy_format_error": policy_format_error,
@@ -874,6 +893,7 @@ class CanvasCRUDEnv:
             "target_canvas": self.target_canvas,
             "rendered_image_path": rendered_image_path,
             "rendered_image_url": rendered_image_url,
+            "render_error": render_error,
             "target_image_path": self.target_image_path,
             "target_image_url": self.target_image_url,
             "critic_feedback": critic_feedback,
