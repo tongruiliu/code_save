@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--api-key", type=str, default="")
     p.add_argument("--api-base-url", type=str, default="")
     p.add_argument("--policy-max-tokens", type=int, default=None)
+    p.add_argument("--policy-timeout-sec", type=int, default=120)
     p.add_argument("--temperature", type=float, default=0.0)
 
     p.add_argument("--critic-model", type=str, default=None)
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--critic-api-key", type=str, default="")
     p.add_argument("--critic-api-base-url", type=str, default="")
     p.add_argument("--critic-max-tokens", type=int, default=None)
+    p.add_argument("--critic-timeout-sec", type=int, default=120)
     p.add_argument("--disable-critic", action="store_true")
 
     p.add_argument("--base-data-json", type=str, required=True)
@@ -90,6 +92,7 @@ def main() -> None:
         api_base_url=args.api_base_url,
         max_tokens=args.policy_max_tokens,
         temperature=args.temperature,
+        timeout_sec=args.policy_timeout_sec,
     )
 
     critic = None
@@ -101,6 +104,7 @@ def main() -> None:
             api_base_url=args.critic_api_base_url or args.api_base_url,
             max_tokens=args.critic_max_tokens,
             temperature=0.0,
+            timeout_sec=args.critic_timeout_sec,
         )
 
     cfg = PipelineConfig(

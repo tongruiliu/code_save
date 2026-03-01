@@ -65,7 +65,7 @@ The results of the function calls will be given back to you after execution, and
 # Notebook & Tools #
 The notebook is an HTML container (**Width: 800px**, Height: Auto). You have 5 tools to manipulate it.
 <tools>
-__TOOLS__
+{provided_tools}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -210,4 +210,4 @@ Rules:
 def build_system_prompt(tools: List[Dict[str, Any]]) -> str:
     # Keep prompt-readable schema; JSON is easier for models than Python repr.
     tools_text = json.dumps(tools, ensure_ascii=False, indent=2)
-    return SYSTEM_PROMPT_TEMPLATE.replace("__TOOLS__", tools_text)
+    return SYSTEM_PROMPT_TEMPLATE.replace("{provided_tools}", tools_text)

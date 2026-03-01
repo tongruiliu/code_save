@@ -34,6 +34,7 @@ class ModelConfig:
     api_base_url: str
     max_tokens: Optional[int] = None
     temperature: float = 0.0
+    timeout_sec: Optional[int] = 120
 
 
 @dataclass
@@ -129,6 +130,8 @@ def _call_model(cfg: ModelConfig, messages: List[Dict[str, Any]]) -> tuple[str, 
         kwargs["api_key"] = cfg.api_key
     if cfg.max_tokens is not None and cfg.max_tokens > 0:
         kwargs["max_tokens"] = cfg.max_tokens
+    if cfg.timeout_sec is not None and cfg.timeout_sec > 0:
+        kwargs["timeout"] = cfg.timeout_sec
 
     res = _call_completion_with_retry(kwargs)
     msg = res.choices[0].message
@@ -204,6 +207,14 @@ def _extract_answer_candidate(parsed: Dict[str, Any]) -> str:
     return str(parsed.get("content", "") or "").strip()
 
 
+def _answer_field_format_ok(parsed: Dict[str, Any]) -> bool:
+    # Relaxed rule: assistant can output long reasoning text.
+    # As long as it contains <answer>...</answer> and a boxed answer, format is accepted.
+    has_answer_tag = bool(parsed.get("has_answer_tag"))
+    has_boxed = bool(str(parsed.get("boxed", "") or "").strip())
+    return has_answer_tag and has_boxed
+
+
 def _judge_answer_with_critic(
     critic_cfg: Optional[ModelConfig],
     task: TaskItem,
@@ -211,17 +222,17 @@ def _judge_answer_with_critic(
     assistant_raw: str,
     rendered_image_path: str,
 ) -> Dict[str, Any]:
-    base_format_ok = bool(parsed.get("has_answer_tag")) and bool(str(parsed.get("boxed", "") or "").strip())
+    base_format_ok = _answer_field_format_ok(parsed)
     candidate = _extract_answer_candidate(parsed)
 
     if critic_cfg is None:
         is_correct = any(equivalent_answer(candidate, g) for g in task.answers) if task.answers else False
         if not base_format_ok:
-            feedback = "Format error: please output exactly <answer>\\boxed{...}</answer>."
+            feedback = "Format error: please include <answer>\\boxed{...}</answer> in your response."
         elif is_correct:
             feedback = "Accepted."
         else:
-            feedback = "Answer seems incorrect; please re-check and revise."
+            feedback = "Incorrect. Please re-check with notebook evidence and revise."
         return {
             "format_ok": base_format_ok,
             "is_correct": bool(base_format_ok and is_correct),
@@ -247,6 +258,42 @@ def _judge_answer_with_critic(
     ]
     judge_raw, _ = _call_model(critic_cfg, judge_messages)
     obj = _json_obj_from_text(judge_raw)
+    if ("format_ok" not in obj) and ("is_correct" not in obj):
+        # One retry with explicit JSON-only constraint to stabilize judge output.
+        retry_messages = judge_messages + [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Return ONLY strict JSON with keys: "
+                            "format_ok, is_correct, normalized_answer, feedback. "
+                            "No extra words."
+                        ),
+                    }
+                ],
+            }
+        ]
+        judge_raw, _ = _call_model(critic_cfg, retry_messages)
+        obj = _json_obj_from_text(judge_raw)
+
+    has_structured_fields = ("format_ok" in obj) or ("is_correct" in obj)
+    if not has_structured_fields:
+        # Critic didn't follow JSON contract. Reject and ask assistant to output strict format again.
+        format_ok = base_format_ok
+        is_correct = False
+        feedback = (
+            "Answer judge output was invalid. "
+            "Please keep an explicit <answer>\\boxed{...}</answer> and try again."
+        )
+        return {
+            "format_ok": format_ok,
+            "is_correct": is_correct,
+            "normalized_answer": candidate,
+            "feedback": feedback,
+            "judge_raw": judge_raw,
+        }
 
     judge_format_ok = _to_bool(obj.get("format_ok"), default=base_format_ok)
     format_ok = bool(base_format_ok and judge_format_ok)
@@ -256,14 +303,11 @@ def _judge_answer_with_critic(
 
     if not format_ok:
         is_correct = False
-        if not feedback:
-            feedback = "Format error: please output exactly <answer>\\boxed{...}</answer>."
+        feedback = "Format error: please include <answer>\\boxed{...}</answer> in your response."
     elif not is_correct:
-        if not feedback:
-            feedback = "Your final answer is not equivalent to the reference answer; please re-think and revise."
+        feedback = "Incorrect. Please re-check with notebook evidence and revise."
     else:
-        if not feedback:
-            feedback = "Accepted."
+        feedback = "Accepted."
 
     return {
         "format_ok": format_ok,
@@ -351,8 +395,8 @@ def _build_answer_feedback_message(rendered_path: str, feedback: str) -> Dict[st
             "type": "text",
             "text": (
                 f"<answer_judge>{feedback}</answer_judge>\n"
-                "Please revise. Final response must be exactly in the format "
-                "<answer>\\boxed{...}</answer>."
+                "Please revise. Your response must include an explicit "
+                "<answer>\\boxed{...}</answer> field."
             ),
         }
     )
@@ -385,10 +429,17 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
     assistant_turns: List[Dict[str, Any]] = []
     final_answer = ""
     success = False
+    print(f"[TaskStart] task_id={task.task_id} pid={task.pid}", flush=True)
 
     for turn in range(1, cfg.max_rounds + 1):
+        print(f"[TurnStart] task_id={task.task_id} pid={task.pid} turn={turn}", flush=True)
         raw, usage = _call_model(cfg.policy, messages)
         parsed = parse_response(raw)
+        print(
+            f"[TurnPolicyDone] task_id={task.task_id} pid={task.pid} turn={turn} "
+            f"tool_calls={len(parsed.get('tool_calls', []))} has_answer={bool(parsed.get('has_answer_tag')) or bool(parsed.get('boxed'))}",
+            flush=True,
+        )
 
         seed_content = str(parsed.get("seed_content", "") or "").strip()
         if parsed.get("tool_calls"):
@@ -427,6 +478,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
         critique = ""
         no_tool_calls = len(tool_calls) == 0
         answer_judge: Dict[str, Any] = {}
+        appended_answer_feedback = False
 
         if not no_tool_calls:
             for i, tc in enumerate(tool_calls):
@@ -512,6 +564,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                     str(answer_judge.get("feedback", "") or "Answer rejected. Please revise."),
                 )
             )
+            appended_answer_feedback = True
 
         turn_item["tool_response"] = latest_tool_response
         turn_item["rendered_image_path"] = latest_render_for_turn
@@ -519,7 +572,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
         if answer_judge:
             turn_item["answer_judge"] = answer_judge
         assistant_turns.append(turn_item)
-        if no_tool_calls:
+        if no_tool_calls and not appended_answer_feedback:
             messages.append({"role": "user", "content": [{"type": "text", "text": FINAL_ANSWER_RETRY_PROMPT}]})
 
     if not success and cfg.max_final_retries > 0:
