@@ -29,11 +29,17 @@ python -m playwright install chromium
 
 export POLICY_API_KEY="your_api_key"
 export POLICY_API_BASE_URL="https://your-openai-compatible-endpoint/v1"
+export POLICY_MODEL="gpt-5.2"
+export CRITIC_MODEL="gpt-4.1-mini"
 export START=0
 export END=100
 
 bash ./run_mathvista_pipeline.sh
 ```
+
+Notes:
+- `POLICY_API_KEY` / `POLICY_API_BASE_URL` are shared by default with critic.
+- `CRITIC_MODEL` must be set explicitly and is independent from `POLICY_MODEL`.
 
 Outputs:
 - `canvas_sft_pipeline/results/canvas-sft-<tag>.json`

@@ -8,7 +8,8 @@ POLICY_MAX_TOKENS="${POLICY_MAX_TOKENS:-32768}"
 
 CRITIC_API_KEY="${CRITIC_API_KEY:-${POLICY_API_KEY}}"
 CRITIC_API_BASE_URL="${CRITIC_API_BASE_URL:-${POLICY_API_BASE_URL}}"
-CRITIC_MODEL="${CRITIC_MODEL:-gpt-5.2}"
+# Critic model is intentionally configured independently from policy model.
+CRITIC_MODEL="${CRITIC_MODEL:-}"
 CRITIC_MAX_TOKENS="${CRITIC_MAX_TOKENS:-4096}"
 
 MODEL_PROVIDER="openai"
@@ -41,6 +42,10 @@ if [[ -z "${POLICY_API_KEY}" ]]; then
 fi
 if [[ -z "${POLICY_API_BASE_URL}" ]]; then
   echo "POLICY_API_BASE_URL is empty." >&2
+  exit 1
+fi
+if [[ -z "${CRITIC_MODEL}" ]]; then
+  echo "CRITIC_MODEL is empty. Please set it explicitly (can differ from POLICY_MODEL)." >&2
   exit 1
 fi
 if [[ ! -f "${BASE_DATA_JSON}" ]]; then

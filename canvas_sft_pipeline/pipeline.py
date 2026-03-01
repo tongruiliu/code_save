@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import time
 import uuid
@@ -11,11 +10,17 @@ from typing import Any, Dict, List, Optional
 import litellm
 from litellm import completion
 
-from .blackboard_tools import blackboard_tools
 from .blackboard import Blackboard
+from .blackboard_tools import blackboard_tools
 from .io_utils import TaskItem, equivalent_answer, path_to_data_url
 from .parser import parse_response
-from .prompts import CRITIQUE_PROMPT, CRITIQUE_SYSTEM, FINAL_ANSWER_RETRY_PROMPT, build_system_prompt
+from .prompts import (
+    CRITIQUE_PROMPT,
+    CRITIQUE_SYSTEM,
+    CRITIQUE_SYSTEM_WO_IMG,
+    FINAL_ANSWER_RETRY_PROMPT,
+    build_system_prompt,
+)
 
 
 @dataclass
@@ -55,6 +60,20 @@ def _usage_to_dict(usage: Any) -> Dict[str, int]:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
 
 
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: List[str] = []
+        for x in content:
+            if not isinstance(x, dict):
+                continue
+            if x.get("type") == "text":
+                chunks.append(str(x.get("text", "")))
+        return "\n".join(chunks).strip()
+    return str(content)
+
+
 def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for msg in messages:
@@ -62,11 +81,14 @@ def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not isinstance(content, list):
             out.append(msg)
             continue
-        items = []
+        items: List[Dict[str, Any]] = []
         for item in content:
-            if not isinstance(item, dict) or item.get("type") != "image_url":
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "image_url":
                 items.append(item)
                 continue
+
             image_obj = dict(item.get("image_url", {}) or {})
             url = str(image_obj.get("url", "") or "").strip()
             resolved = path_to_data_url(url)
@@ -78,6 +100,17 @@ def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             items.append(new_item)
         out.append({"role": msg.get("role"), "content": items})
     return out
+
+
+def _call_completion_with_retry(kwargs: Dict[str, Any], limit: int = 5, pause: float = 5.0) -> Any:
+    for attempt in range(1, limit + 1):
+        try:
+            return completion(**kwargs)
+        except Exception:
+            if attempt >= limit:
+                raise
+            time.sleep(pause)
+    raise RuntimeError("unreachable")
 
 
 def _call_model(cfg: ModelConfig, messages: List[Dict[str, Any]]) -> tuple[str, Dict[str, int]]:
@@ -93,9 +126,10 @@ def _call_model(cfg: ModelConfig, messages: List[Dict[str, Any]]) -> tuple[str, 
         kwargs["api_key"] = cfg.api_key
     if cfg.max_tokens is not None and cfg.max_tokens > 0:
         kwargs["max_tokens"] = cfg.max_tokens
-    res = completion(**kwargs)
+
+    res = _call_completion_with_retry(kwargs)
     msg = res.choices[0].message
-    text = msg.content if isinstance(msg.content, str) else str(msg.content)
+    text = _message_content_to_text(getattr(msg, "content", ""))
     return text, _usage_to_dict(getattr(res, "usage", None))
 
 
@@ -106,33 +140,44 @@ def _call_critic(
     rendered_image_path: str,
 ) -> str:
     if critic_cfg is None:
-        return "No critic configured. Continue with one precise correction step if needed."
+        return "No critic configured."
+
+    has_original = bool(path_to_data_url(original_image_path))
+    system_prompt = CRITIQUE_SYSTEM if has_original else CRITIQUE_SYSTEM_WO_IMG
+
+    content: List[Dict[str, Any]] = [
+        {"type": "text", "text": question},
+    ]
+    if has_original:
+        content.append({"type": "image_url", "image_url": {"url": original_image_path}})
+    content.append({"type": "image_url", "image_url": {"url": rendered_image_path}})
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": CRITIQUE_SYSTEM}]},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"Question: {question}"},
-                {"type": "image_url", "image_url": {"url": original_image_path}},
-                {"type": "image_url", "image_url": {"url": rendered_image_path}},
-            ],
-        },
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+        {"role": "user", "content": content},
     ]
     critique, _ = _call_model(critic_cfg, messages)
     return critique.strip()
 
 
-def _init_blackboard_with_base_image(blackboard: Blackboard, image_ref: str) -> None:
+def _build_base_fragment(image_ref: str) -> str:
     data_url = path_to_data_url(image_ref)
     if not data_url:
-        return
-    fragment = (
+        return ""
+    return (
         "<figure id='base_figure'>"
         f"<img id='base_image' src='{data_url}'/>"
         "</figure>"
     )
-    blackboard.update_state(action="insert_element", attrs={"fragment": fragment, "rootId": "root"})
+
+
+def _reset_blackboard_to_base(blackboard: Blackboard, base_fragment: str) -> None:
+    blackboard.update_state(action="clear", attrs={})
+    if base_fragment:
+        blackboard.update_state(
+            action="insert_element",
+            attrs={"fragment": base_fragment, "rootId": "root"},
+        )
 
 
 def _render(blackboard: Blackboard, out_path: str) -> str:
@@ -167,25 +212,19 @@ def _tool_error(name: str, args: Any) -> Optional[str]:
 
 
 def _build_init_user_message(task: TaskItem, rendered_zero_path: str) -> Dict[str, Any]:
-    content: List[Dict[str, Any]] = [
-        {"type": "text", "text": f"Question: {task.instruction}"},
-    ]
+    content: List[Dict[str, Any]] = [{"type": "text", "text": task.instruction}]
     if task.image_path:
-        content.append({"type": "text", "text": "Original image:"})
         content.append({"type": "image_url", "image_url": {"url": task.image_path}})
     if rendered_zero_path:
-        content.append({"type": "text", "text": "Current notebook state:"})
         content.append({"type": "image_url", "image_url": {"url": rendered_zero_path}})
     return {"role": "user", "content": content}
 
 
-def _build_feedback_user_message(rendered_path: str, critique: str, tool_response: str) -> Dict[str, Any]:
+def _build_tool_feedback_message(rendered_path: str, tool_response: str) -> Dict[str, Any]:
     content: List[Dict[str, Any]] = []
     if rendered_path:
         content.append({"type": "image_url", "image_url": {"url": rendered_path}})
-    content.append({"type": "text", "text": CRITIQUE_PROMPT.format(critical_check=critique)})
-    if tool_response:
-        content.append({"type": "text", "text": f"<tool_response>{tool_response}</tool_response>"})
+    content.append({"type": "text", "text": f"<tool_response>{tool_response}</tool_response>"})
     return {"role": "user", "content": content}
 
 
@@ -195,15 +234,20 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
     os.makedirs(render_dir, exist_ok=True)
 
     blackboard = Blackboard()
-    _init_blackboard_with_base_image(blackboard, task.image_path)
+    base_fragment = _build_base_fragment(task.image_path)
+    if base_fragment:
+        blackboard.update_state(action="insert_element", attrs={"fragment": base_fragment, "rootId": "root"})
 
     turn0_path = os.path.join(render_dir, "rendered-turn-000.png")
     turn0_ret = _render(blackboard, turn0_path)
     if turn0_ret != "tool execute success":
         turn0_path = ""
 
+    last_success_state = blackboard.state
+    last_success_render = turn0_path
+
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(blackboard_tools)},
+        {"role": "system", "content": [{"type": "text", "text": build_system_prompt(blackboard_tools)}]},
         _build_init_user_message(task, turn0_path),
     ]
 
@@ -214,81 +258,122 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
     for turn in range(1, cfg.max_rounds + 1):
         raw, usage = _call_model(cfg.policy, messages)
         parsed = parse_response(raw)
-        messages.append({"role": "assistant", "content": raw})
+
+        seed_content = str(parsed.get("seed_content", "") or "").strip()
+        if parsed.get("tool_calls"):
+            seed_content = seed_content.split("\\boxed")[0].strip()
+        if not seed_content:
+            seed_content = str(parsed.get("content", "") or "").strip()
+        if not seed_content:
+            seed_content = raw
+
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": seed_content}]})
 
         turn_item: Dict[str, Any] = {
             "turn": turn,
             "assistant_raw": raw,
+            "assistant_seed_content": seed_content,
             "parsed": copy.deepcopy(parsed),
             "policy_usage": usage,
             "tool_results": [],
-            "rendered_image_path": "",
+            "rendered_image_path": last_success_render,
             "tool_response": "",
             "critic_feedback": "",
         }
 
-        tool_calls = parsed.get("tool_calls", [])
-        tool_response = ""
-        rendered_path = ""
-        critique = ""
+        tool_calls = list(parsed.get("tool_calls", []))
+        if len(tool_calls) > 8:
+            tool_calls = tool_calls[:8]
+            messages.append(
+                _build_tool_feedback_message(
+                    last_success_render,
+                    "Error: too many tool calls in one turn; truncated to first 8.",
+                )
+            )
 
-        if tool_calls:
-            latest_render_ret = ""
+        latest_tool_response = ""
+        latest_render_for_turn = last_success_render
+        critique = ""
+        no_tool_calls = len(tool_calls) == 0
+
+        if not no_tool_calls:
             for i, tc in enumerate(tool_calls):
                 name = str(tc.get("name", "")).strip()
                 args = tc.get("arguments", {})
                 err = _tool_error(name, args)
                 if err:
                     result = f"Error: {err}"
-                    turn_item["tool_results"].append({"index": i, "name": name, "arguments": args, "result": result})
-                    tool_response = result
+                    latest_tool_response = result
+                    turn_item["tool_results"].append(
+                        {"index": i, "name": name, "arguments": args, "result": result}
+                    )
+                    messages.append(_build_tool_feedback_message(last_success_render, result))
                     continue
 
+                state_before = blackboard.state
+                render_before = last_success_render
                 try:
                     blackboard.update_state(action=name, attrs=args)
+                    if name == "clear":
+                        _reset_blackboard_to_base(blackboard, base_fragment)
+
                     rendered_path = os.path.join(render_dir, f"rendered-turn-{turn:03d}-tool-{i:02d}.png")
-                    latest_render_ret = _render(blackboard, rendered_path)
-                    if latest_render_ret != "tool execute success":
-                        result = f"Error: {latest_render_ret}"
+                    ret = _render(blackboard, rendered_path)
+                    if ret != "tool execute success":
+                        blackboard.state = state_before
+                        result = f"Error: {ret}. Reverted to previous successful state."
+                        messages.append(_build_tool_feedback_message(render_before, result))
                     else:
                         result = "tool execute success"
+                        last_success_state = blackboard.state
+                        last_success_render = rendered_path
+                        latest_render_for_turn = rendered_path
+                        messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": rendered_path}}]})
                 except Exception as exc:
-                    result = f"Error: {exc}"
+                    blackboard.state = state_before
+                    result = f"Error: {exc}. Reverted to previous successful state."
+                    messages.append(_build_tool_feedback_message(render_before, result))
 
-                turn_item["tool_results"].append({"index": i, "name": name, "arguments": args, "result": result})
+                turn_item["tool_results"].append(
+                    {"index": i, "name": name, "arguments": args, "result": result}
+                )
                 if result.startswith("Error:"):
-                    tool_response = result
+                    latest_tool_response = result
 
-            if not tool_response:
-                if turn_item["tool_results"]:
-                    if all(str(x.get("result", "")).startswith("Error:") for x in turn_item["tool_results"]):
-                        tool_response = str(turn_item["tool_results"][0].get("result", "Error: tool failed"))
-                    else:
-                        tool_response = "tool execute success"
+            # Keep state/render pointers consistent after a turn.
+            if not last_success_render:
+                blackboard.state = last_success_state
 
-            if rendered_path and os.path.exists(rendered_path):
-                critique = _call_critic(cfg.critic, task.question, task.image_path, rendered_path)
-                messages.append(_build_feedback_user_message(rendered_path, critique, tool_response))
-        
+            if not latest_tool_response:
+                latest_tool_response = "tool execute success"
+
+            if last_success_render:
+                critique = _call_critic(cfg.critic, task.question, task.image_path, last_success_render)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": CRITIQUE_PROMPT.format(critical_check=critique)}],
+                    }
+                )
+
         if parsed.get("boxed"):
             final_answer = str(parsed.get("boxed", "")).strip()
             if task.answers:
                 success = any(equivalent_answer(final_answer, g) for g in task.answers)
             else:
                 success = True
-            turn_item["tool_response"] = tool_response
-            turn_item["rendered_image_path"] = rendered_path
+            turn_item["tool_response"] = latest_tool_response
+            turn_item["rendered_image_path"] = latest_render_for_turn
             turn_item["critic_feedback"] = critique
             assistant_turns.append(turn_item)
             break
 
-        turn_item["tool_response"] = tool_response
-        turn_item["rendered_image_path"] = rendered_path
+        turn_item["tool_response"] = latest_tool_response
+        turn_item["rendered_image_path"] = latest_render_for_turn
         turn_item["critic_feedback"] = critique
         assistant_turns.append(turn_item)
-
-        if not tool_calls:
-            messages.append({"role": "user", "content": [{"type": "text", "text": FINAL_ANSWER_RETRY_PROMPT}]})
+        if no_tool_calls:
+            break
 
     if not success and cfg.max_final_retries > 0:
         for _ in range(cfg.max_final_retries):
@@ -297,15 +382,17 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 messages + [{"role": "user", "content": [{"type": "text", "text": FINAL_ANSWER_RETRY_PROMPT}]}],
             )
             parsed = parse_response(raw)
-            messages.append({"role": "assistant", "content": raw})
+            final_text = str(parsed.get("content", "") or "").strip() or raw
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
             assistant_turns.append(
                 {
                     "turn": len(assistant_turns) + 1,
                     "assistant_raw": raw,
+                    "assistant_seed_content": final_text,
                     "parsed": copy.deepcopy(parsed),
                     "policy_usage": usage,
                     "tool_results": [],
-                    "rendered_image_path": "",
+                    "rendered_image_path": last_success_render,
                     "tool_response": "",
                     "critic_feedback": "",
                 }
@@ -333,7 +420,8 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 "pid": task.pid,
                 "reward": reward,
                 "messages": copy.deepcopy(prefix),
-                "assistant_target": str(msg.get("content", "")),
+                "assistant_target": copy.deepcopy(msg.get("content")),
+                "assistant_target_text": _message_content_to_text(msg.get("content")),
                 "turn_meta": turn_meta,
             }
         )
@@ -370,7 +458,10 @@ def run_tasks(tasks: List[TaskItem], cfg: PipelineConfig) -> List[Dict[str, Any]
         try:
             result = run_task(task, cfg)
             status = "PASS" if result["reward"] >= 1.0 else "FAIL"
-            print(f"{status} task_id={task.task_id} pid={task.pid} reward={result['reward']} turns={len(result['turns'])}")
+            print(
+                f"{status} task_id={task.task_id} pid={task.pid} "
+                f"reward={result['reward']} turns={len(result['turns'])}"
+            )
         except Exception as exc:
             result = {
                 "task_id": task.task_id,
