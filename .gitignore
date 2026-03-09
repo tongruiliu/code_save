@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+
+canvas_sft_pipeline/results/

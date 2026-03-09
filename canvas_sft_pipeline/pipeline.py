@@ -183,6 +183,15 @@ def _to_bool(v: Any, default: bool = False) -> bool:
     return default
 
 
+def _critic_feedback_is_consistent(critic_feedback: str, critic_cfg: Optional[ModelConfig]) -> bool:
+    if critic_cfg is None:
+        return True
+    obj = _json_obj_from_text(critic_feedback)
+    if not obj:
+        return False
+    return _to_bool(obj.get("is_consistent"), default=False)
+
+
 def _extract_answer_candidate(parsed: Dict[str, Any]) -> str:
     boxed = str(parsed.get("boxed", "") or "").strip()
     if boxed:
@@ -520,6 +529,19 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
 
         answer_present = bool(parsed.get("has_answer_tag")) or bool(str(parsed.get("boxed", "")).strip())
         if answer_present:
+            if cfg.critic is not None and not critique and (latest_render_for_turn or last_success_render):
+                critique = _call_critic(
+                    cfg.critic,
+                    task.question,
+                    task.image_path,
+                    latest_render_for_turn or last_success_render,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": CRITIQUE_PROMPT.format(critical_check=critique)}],
+                    }
+                )
             answer_judge = _judge_answer_with_critic(
                 cfg.critic,
                 task,
@@ -528,7 +550,8 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 latest_render_for_turn or last_success_render,
             )
             turn_item["answer_judge"] = answer_judge
-            if answer_judge.get("format_ok") and answer_judge.get("is_correct"):
+            critic_is_consistent = _critic_feedback_is_consistent(critique, cfg.critic)
+            if answer_judge.get("format_ok") and answer_judge.get("is_correct") and critic_is_consistent:
                 final_answer = str(answer_judge.get("normalized_answer", "") or _extract_answer_candidate(parsed)).strip()
                 success = True
                 turn_item["tool_response"] = latest_tool_response
@@ -536,10 +559,13 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 turn_item["critic_feedback"] = critique
                 assistant_turns.append(turn_item)
                 break
+            feedback = str(answer_judge.get("feedback", "") or "Answer rejected. Please revise.")
+            if answer_judge.get("format_ok") and answer_judge.get("is_correct") and not critic_is_consistent:
+                feedback = "Answer is correct but notebook is inconsistent with the image. Revise the notebook and answer."
             messages.append(
                 _build_answer_feedback_message(
                     latest_render_for_turn or last_success_render,
-                    str(answer_judge.get("feedback", "") or "Answer rejected. Please revise."),
+                    feedback,
                 )
             )
             appended_answer_feedback = True
@@ -575,6 +601,16 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                     "critic_feedback": "",
                 }
             )
+            critique = ""
+            if cfg.critic is not None and last_success_render:
+                critique = _call_critic(cfg.critic, task.question, task.image_path, last_success_render)
+                assistant_turns[-1]["critic_feedback"] = critique
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": CRITIQUE_PROMPT.format(critical_check=critique)}],
+                    }
+                )
             answer_judge = _judge_answer_with_critic(
                 cfg.critic,
                 task,
@@ -583,14 +619,18 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 last_success_render,
             )
             assistant_turns[-1]["answer_judge"] = answer_judge
-            if answer_judge.get("format_ok") and answer_judge.get("is_correct"):
+            critic_is_consistent = _critic_feedback_is_consistent(critique, cfg.critic)
+            if answer_judge.get("format_ok") and answer_judge.get("is_correct") and critic_is_consistent:
                 final_answer = str(answer_judge.get("normalized_answer", "") or _extract_answer_candidate(parsed)).strip()
                 success = True
                 break
+            feedback = str(answer_judge.get("feedback", "") or "Answer rejected. Please revise.")
+            if answer_judge.get("format_ok") and answer_judge.get("is_correct") and not critic_is_consistent:
+                feedback = "Answer is correct but notebook is inconsistent with the image. Revise the notebook and answer."
             messages.append(
                 _build_answer_feedback_message(
                     last_success_render,
-                    str(answer_judge.get("feedback", "") or "Answer rejected. Please revise."),
+                    feedback,
                 )
             )
 
