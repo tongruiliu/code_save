@@ -64,6 +64,20 @@ def _usage_to_dict(usage: Any) -> Dict[str, int]:
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": t}
 
 
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: List[str] = []
+        for x in content:
+            if not isinstance(x, dict):
+                continue
+            if x.get("type") == "text":
+                chunks.append(str(x.get("text", "")))
+        return "\n".join(chunks).strip()
+    return str(content)
+
+
 def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for msg in messages:
