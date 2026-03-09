@@ -464,14 +464,6 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
         }
 
         tool_calls = list(parsed.get("tool_calls", []))
-        if len(tool_calls) > 8:
-            tool_calls = tool_calls[:8]
-            messages.append(
-                _build_tool_feedback_message(
-                    last_success_render,
-                    "Error: too many tool calls in one turn; truncated to first 8.",
-                )
-            )
 
         latest_tool_response = ""
         latest_render_for_turn = last_success_render
