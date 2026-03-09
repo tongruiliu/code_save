@@ -78,6 +78,18 @@ def _message_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _merge_reasoning_into_message_text(message: Any, text: str) -> str:
+    reasoning = _message_content_to_text(getattr(message, "reasoning_content", ""))
+    if not reasoning.strip():
+        return text
+    if "<think>" in text.lower():
+        return text
+    merged = f"<think>{reasoning.strip()}</think>"
+    if text.strip():
+        merged = f"{merged}\n{text.strip()}"
+    return merged
+
+
 def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for msg in messages:
@@ -104,6 +116,24 @@ def _materialize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             items.append(new_item)
         out.append({"role": msg.get("role"), "content": items})
     return out
+
+
+def _upsert_latest_render_observation(messages: List[Dict[str, Any]], rendered_path: str) -> None:
+    if not rendered_path:
+        return
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            continue
+        item = content[0]
+        if not isinstance(item, dict) or item.get("type") != "image_url":
+            continue
+        del messages[idx]
+        break
+    messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": rendered_path}}]})
 
 
 def _call_completion_with_retry(kwargs: Dict[str, Any], limit: int = 5, pause: float = 5.0) -> Any:
@@ -136,6 +166,7 @@ def _call_model(cfg: ModelConfig, messages: List[Dict[str, Any]]) -> tuple[str, 
     res = _call_completion_with_retry(kwargs)
     msg = res.choices[0].message
     text = _message_content_to_text(getattr(msg, "content", ""))
+    text = _merge_reasoning_into_message_text(msg, text)
     return text, _usage_to_dict(getattr(res, "usage", None))
 
 
@@ -450,20 +481,18 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
             flush=True,
         )
 
-        seed_content = str(parsed.get("seed_content", "") or "").strip()
-        if parsed.get("tool_calls"):
-            seed_content = seed_content.split("\\boxed")[0].strip()
-        if not seed_content:
-            seed_content = str(parsed.get("content", "") or "").strip()
-        if not seed_content:
-            seed_content = raw
+        assistant_message_text = str(raw or "").strip()
+        if not assistant_message_text:
+            assistant_message_text = str(parsed.get("seed_content", "") or "").strip()
+        if not assistant_message_text:
+            assistant_message_text = str(parsed.get("content", "") or "").strip()
 
-        messages.append({"role": "assistant", "content": [{"type": "text", "text": seed_content}]})
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": assistant_message_text}]})
 
         turn_item: Dict[str, Any] = {
             "turn": turn,
             "assistant_raw": raw,
-            "assistant_seed_content": seed_content,
+            "assistant_seed_content": assistant_message_text,
             "parsed": copy.deepcopy(parsed),
             "policy_usage": usage,
             "tool_results": [],
@@ -513,7 +542,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                         last_success_state = blackboard.state
                         last_success_render = rendered_path
                         latest_render_for_turn = rendered_path
-                        messages.append({"role": "user", "content": [{"type": "image_url", "image_url": {"url": rendered_path}}]})
+                        _upsert_latest_render_observation(messages, rendered_path)
                 except Exception as exc:
                     blackboard.state = state_before
                     result = f"Error: {exc}. Reverted to previous successful state."
@@ -600,13 +629,17 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 messages + [{"role": "user", "content": [{"type": "text", "text": FINAL_ANSWER_RETRY_PROMPT}]}],
             )
             parsed = parse_response(raw)
-            final_text = str(parsed.get("content", "") or "").strip() or raw
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
+            assistant_message_text = str(raw or "").strip()
+            if not assistant_message_text:
+                assistant_message_text = str(parsed.get("seed_content", "") or "").strip()
+            if not assistant_message_text:
+                assistant_message_text = str(parsed.get("content", "") or "").strip()
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": assistant_message_text}]})
             assistant_turns.append(
                 {
                     "turn": len(assistant_turns) + 1,
                     "assistant_raw": raw,
-                    "assistant_seed_content": final_text,
+                    "assistant_seed_content": assistant_message_text,
                     "parsed": copy.deepcopy(parsed),
                     "policy_usage": usage,
                     "tool_results": [],
