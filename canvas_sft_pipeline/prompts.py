@@ -196,14 +196,13 @@ Output MUST be strict JSON:
 {
   "format_ok": true/false,
   "is_correct": true/false,
-  "normalized_answer": "short normalized answer if possible",
-  "feedback": "one concise sentence for assistant; if correct, say accepted"
+  "normalized_answer": "short normalized answer if possible"
 }
 
 Rules:
 - `format_ok` is false if assistant does not use `<answer>\\boxed{...}</answer>`.
-- If format is wrong, set `is_correct` to false and provide format correction feedback.
-- If uncertain, prefer false and explain briefly.
+- If format is wrong, set `is_correct` to false.
+- If uncertain, prefer false.
 """.strip()
 
 
@@ -240,8 +239,7 @@ Return ONLY strict JSON in this format:
   "is_consistent": true/false,
   "format_ok": true/false,
   "is_correct": true/false,
-  "normalized_answer": "short normalized answer if possible",
-  "feedback": "one concise sentence for assistant; if correct, say accepted"
+  "normalized_answer": "short normalized answer if possible"
 }
 
 Rules:

@@ -207,14 +207,26 @@ def _json_obj_from_text(text: str) -> Dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         pass
-    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if not m:
-        return {}
-    try:
-        obj = json.loads(m.group(0))
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
+    fenced_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    for block in reversed(fenced_matches):
+        try:
+            obj = json.loads(block)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+
+    decoder = json.JSONDecoder()
+    candidates: List[Dict[str, Any]] = []
+    for match in re.finditer(r"\{", raw):
+        start = match.start()
+        try:
+            obj, end = decoder.raw_decode(raw[start:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    return candidates[-1] if candidates else {}
 
 
 def _to_bool(v: Any, default: bool = False) -> bool:
@@ -290,7 +302,7 @@ def _judge_answer_with_critic(
             "format_ok": True,
             "is_correct": False,
             "normalized_answer": candidate,
-            "feedback": "Incorrect. Please re-check with notebook evidence and revise.",
+            "feedback": "Answer rejected. Please revise.",
             "judge_raw": "",
         }
 
@@ -321,7 +333,7 @@ def _judge_answer_with_critic(
                         "type": "text",
                         "text": (
                             "Return ONLY strict JSON with keys: "
-                            "format_ok, is_correct, normalized_answer, feedback. "
+                            "format_ok, is_correct, normalized_answer. "
                             "No extra words."
                         ),
                     }
@@ -338,7 +350,7 @@ def _judge_answer_with_critic(
         is_correct = False
         feedback = (
             "Answer judge output was invalid. "
-            "Please keep an explicit <answer>\\boxed{...}</answer> and try again."
+            "Please revise and try again."
         )
         return {
             "format_ok": format_ok,
@@ -352,13 +364,13 @@ def _judge_answer_with_critic(
     format_ok = bool(base_format_ok and judge_format_ok)
     is_correct = _to_bool(obj.get("is_correct"), default=False)
     normalized = str(obj.get("normalized_answer", "") or "").strip() or candidate
-    feedback = str(obj.get("feedback", "") or "").strip()
+    feedback = ""
 
     if not format_ok:
         is_correct = False
         feedback = "Format error: please include <answer>\\boxed{...}</answer> in your response."
     elif not is_correct:
-        feedback = "Incorrect. Please re-check with notebook evidence and revise."
+        feedback = "Answer rejected. Please revise."
     else:
         feedback = "Accepted."
 
@@ -387,7 +399,7 @@ def _evaluate_answer_turn_with_critic(
             return "Format error: please include <answer>\\boxed{...}</answer> in your response."
         if is_correct:
             return "Accepted."
-        return "Incorrect. Please re-check with notebook evidence and revise."
+        return "Answer rejected. Please revise."
 
     if critic_cfg is None:
         critique_obj = {"hallucination_elements": [], "is_consistent": True}
@@ -426,7 +438,7 @@ def _evaluate_answer_turn_with_critic(
                         "type": "text",
                         "text": (
                             "Return ONLY strict JSON with keys: hallucination_elements, "
-                            "is_consistent, format_ok, is_correct, normalized_answer, feedback. "
+                            "is_consistent, format_ok, is_correct, normalized_answer. "
                             "No extra words."
                         ),
                     }
@@ -471,7 +483,7 @@ def _evaluate_answer_turn_with_critic(
             "format_ok": True,
             "is_correct": False,
             "normalized_answer": candidate,
-            "feedback": "Answer judge output was invalid. Please revise the answer and try again.",
+            "feedback": "Answer rejected. Please revise.",
             "judge_raw": eval_raw,
         }
         return critique_text, answer_judge
@@ -742,7 +754,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 break
             feedback = str(answer_judge.get("feedback", "") or "Answer rejected. Please revise.")
             if answer_judge.get("format_ok") and answer_judge.get("is_correct") and not critic_is_consistent:
-                feedback = "Answer is correct but notebook is inconsistent with the image. Revise the notebook and answer."
+                feedback = "Answer rejected. Please revise notebook and answer."
             messages.append(
                 _build_answer_feedback_message(
                     latest_render_for_turn or last_success_render,
@@ -809,7 +821,7 @@ def run_task(task: TaskItem, cfg: PipelineConfig) -> Dict[str, Any]:
                 break
             feedback = str(answer_judge.get("feedback", "") or "Answer rejected. Please revise.")
             if answer_judge.get("format_ok") and answer_judge.get("is_correct") and not critic_is_consistent:
-                feedback = "Answer is correct but notebook is inconsistent with the image. Revise the notebook and answer."
+                feedback = "Answer rejected. Please revise notebook and answer."
             messages.append(
                 _build_answer_feedback_message(
                     last_success_render,
