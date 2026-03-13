@@ -1,4 +1,4 @@
-# canvas_sft_pipeline
+# canvas_sft_pipeline_primary
 
 A fresh, standalone Canvas-CoT-style pipeline for generating SFT trajectories.
 
